@@ -12,6 +12,7 @@ if TYPE_CHECKING:
 KST = timezone(timedelta(hours=9)) # UTC+9
 
 class Default(Base):
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     __tablename__ = "defaults"
 
 
