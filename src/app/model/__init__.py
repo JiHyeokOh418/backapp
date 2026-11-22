@@ -15,6 +15,8 @@ from .mood_model import Mood
 from .doctor_profile_model import DoctorProfile
 from .care_relation_model import CareRelation
 from .attendance_model import Attendance
+from .admin_model import Admin
+from .doctor_verification_model import DoctorVerification
 
 # chat
 from .chat_session_model import ChatSession

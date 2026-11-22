@@ -42,7 +42,7 @@ cd src
 uvicorn main:app --reload
 ```
 
-- Swagger: `http://localhost:8000/docs`
+- Swagger: `http://localhost:10000/docs`
 - 환경 변수는 프로젝트 루트의 `.env`에서 로드합니다 (`load_dotenv()`).
 - 서버 시작 시 `Base.metadata.create_all`로 테이블을 자동 생성합니다.
 

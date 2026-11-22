@@ -18,3 +18,10 @@ class SocialProvider(str, Enum):
 class Gender(str, Enum):
     MALE = "male"
     FEMALE = "female"
+
+
+# 의사 승인 신청 상태 (doctor_verifications.status)
+class VerificationStatus(str, Enum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
