@@ -1,7 +1,5 @@
 from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel # JS 카멜 -> Snake로 변경해서 받기
-from datetime import datetime
-from app.enum.s3_enum import S3Folder
 
 class ImageUploadResponseDTO(BaseModel):
     original_key: str | None = None
