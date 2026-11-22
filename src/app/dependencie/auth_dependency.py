@@ -44,8 +44,8 @@ async def get_current_user(
 
 # 2. 의사 전용 API: get_current_user + role == doctor 확인 -> 아니면 403
 # - role은 JWT에 담겨 있어 DB 조회 없이 확인한다.
-# - TODO(명세 4장): 의사 승인 API가 아직 없다. 테스트할 때는 DB에서 users.role='doctor',
-#   care_relations 행을 직접 넣고 다시 로그인해야 토큰의 role이 doctor로 바뀐다.
+# - 관리자가 의사 승인(POST /admin/doctor-verifications/{id}/approve)하면 users.role=doctor가 된다.
+#   토큰의 role은 로그인할 때 정해지므로 승인 후 다시 로그인해야 doctor로 바뀐다. (팀 결정)
 async def get_current_doctor(
     current_user: UserClaimDTO = Depends(get_current_user)
 ) -> UserClaimDTO:
