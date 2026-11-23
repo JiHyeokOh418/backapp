@@ -6,16 +6,15 @@ from app.infrastructure.postgresql import get_postgresql_db
 from fastapi import Depends
 
 # 모델, ORM
-from app.models.chat_session_model import ChatSession
-from app.models.message_model import Message
-from app.models.checklist_item_model import ChecklistItem
-from app.models.session_checklist_model import SessionChecklist
-from app.models.checklist_event_model import ChecklistEvent
-from app.models.llm_call_model import LlmCall
-from app.enums.chat_session_enum import ChatSessionStatus
-from app.enums.message_enum import MessageRole
-from app.enums.common_enum import ChecklistStatus
-from app.enums.session_checklist_enum import SessionChecklistSkipReason
+from app.model.chat_session_model import ChatSession
+from app.model.message_model import Message
+from app.model.checklist_item_model import ChecklistItem
+from app.model.session_checklist_model import SessionChecklist
+from app.model.checklist_event_model import ChecklistEvent
+from app.model.llm_call_model import LlmCall
+from app.model.session_summary_model import SessionSummary
+from app.enum.chat_enum import SessionStatus, MessageRole
+from app.enum.checklist_enum import ChecklistStatus, SkipReason
 from sqlalchemy import select, update, func, exists
 
 KST = timezone(timedelta(hours=9)) # UTC+9
@@ -46,7 +45,7 @@ class LlmRepository:
     # 세션
     # 1. 예정 세션 일괄 생성 (의사 등록)
     # - flush하면 각 세션의 id가 채워져서, 같은 트랜잭션 안에서 바로 체크리스트 생성에 쓸 수 있다.
-    # - prev_session_id(직전 예정 세션)는 앞 세션 id가 필요하므로 이 함수가 돌아온 뒤 service가 채운다.
+    # - prev_session_id(직전 세션)는 service가 find_latest_session_summary로 미리 찾아서 ChatSession에 넣은 뒤 넘긴다. (없으면 None)
     async def create_sessions(self, sessions: list[ChatSession]) -> list[ChatSession]:
         self.db.add_all(sessions)
         await self.db.flush()
@@ -79,7 +78,7 @@ class LlmRepository:
             select(ChatSession)
             .where(
                 ChatSession.user_id == user_id,
-                ChatSession.status == ChatSessionStatus.ACTIVE
+                ChatSession.status == SessionStatus.ACTIVE
             )
             .limit(1)
         )
@@ -93,7 +92,7 @@ class LlmRepository:
             select(ChatSession)
             .where(
                 ChatSession.user_id == user_id,
-                ChatSession.status == ChatSessionStatus.SCHEDULED,
+                ChatSession.status == SessionStatus.SCHEDULED,
                 (ChatSession.expires_at.is_(None)) | (ChatSession.expires_at > now)
             )
             .order_by(ChatSession.scheduled_at.asc(), ChatSession.id.asc())
@@ -108,7 +107,7 @@ class LlmRepository:
         query = select(
             exists().where(
                 ChatSession.user_id == user_id,
-                ChatSession.status == ChatSessionStatus.ACTIVE
+                ChatSession.status == SessionStatus.ACTIVE
             )
         )
         result = await self.db.execute(query)
@@ -118,7 +117,7 @@ class LlmRepository:
     # 5. 세션 상태 갱신
     # - find_session_by_id(..., for_update=True)로 잠가서 읽은 객체를 넘긴다.
     #   (id로 UPDATE를 따로 보내면 메모리의 객체와 DB 값이 어긋난다)
-    # - 예: update_session(session, status=ChatSessionStatus.ENDED, end_reason=ChatSessionEndReason.COMPLETED, ended_at=now)
+    # - 예: update_session(session, status=SessionStatus.ENDED, end_reason=SessionEndReason.COMPLETED, ended_at=now)
     async def update_session(self, session: ChatSession, **fields: Any) -> ChatSession:
         for key, value in fields.items():
             if not hasattr(ChatSession, key):
@@ -286,7 +285,7 @@ class LlmRepository:
         checklist: SessionChecklist,
         to_status: ChecklistStatus,
         value: Any = None,
-        skip_reason: SessionChecklistSkipReason | None = None,
+        skip_reason: SkipReason | None = None,
         evidence_message_id: int | None = None
     ) -> ChecklistEvent:
         event = ChecklistEvent(
@@ -347,6 +346,22 @@ class LlmRepository:
             .values(message_id=message_id)
         )
         await self.db.execute(query)
+
+
+    # 세션 요약
+    # 20. 유저의 가장 최근 세션 요약
+    # - 세션 등록 때 직전 세션(prev_session_id)을 찾는 데 쓴다. 반환값의 session_id가 직전 세션 id이다.
+    # - 요약이 아직 없는 세션(진행 중, 요약 대기·실패·건너뜀)은 대상에서 빠진다. 없으면 None
+    async def find_latest_session_summary(self, user_id: int) -> SessionSummary | None:
+        query = (
+            select(SessionSummary)
+            .join(ChatSession, SessionSummary.session_id == ChatSession.id)
+            .where(ChatSession.user_id == user_id)
+            .order_by(SessionSummary.created_at.desc(), SessionSummary.id.desc())
+            .limit(1)
+        )
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
 
     
 
