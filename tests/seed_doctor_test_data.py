@@ -17,28 +17,29 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from sqlalchemy import delete, or_  # noqa: E402
+from sqlalchemy import delete, select  # noqa: E402
 
-import app.model  # noqa: E402,F401  (모든 모델 등록)
+import app.models  # noqa: E402,F401  (모든 모델 등록)
 from app.infrastructure.postgresql import engine, Base, AsyncSessionLocal  # noqa: E402
-from app.model.user_model import User  # noqa: E402
-from app.model.hospital_model import Hospital  # noqa: E402
-from app.model.doctor_profile_model import DoctorProfile  # noqa: E402
-from app.model.care_relation_model import CareRelation  # noqa: E402
-from app.model.room_model import Room  # noqa: E402
-from app.model.appointment_model import Appointment  # noqa: E402
-from app.model.appointment_change_model import AppointmentChange  # noqa: E402
-from app.model.risk_event_model import RiskEvent  # noqa: E402
-from app.model.risk_event_action_model import RiskEventAction  # noqa: E402
-from app.model.chat_session_model import ChatSession  # noqa: E402
-from app.model.message_model import Message  # noqa: E402
-from app.model.emotion_analysis_model import EmotionAnalysis  # noqa: E402
-from app.model.session_summary_model import SessionSummary  # noqa: E402
-from app.model.checklist_item_model import ChecklistItem  # noqa: E402
-from app.model.session_checklist_model import SessionChecklist  # noqa: E402
-from app.model.assessment_result_model import AssessmentResult  # noqa: E402
-from app.model.emotion_record_model import EmotionRecord  # noqa: E402
-from app.model.doctor_memo_model import DoctorMemo  # noqa: E402
+from app.models.user_model import User  # noqa: E402
+from app.models.hospital_model import Hospital  # noqa: E402
+from app.models.doctor_profile_model import DoctorProfile  # noqa: E402
+from app.models.care_relation_model import CareRelation  # noqa: E402
+from app.models.room_model import Room  # noqa: E402
+from app.models.appointment_model import Appointment  # noqa: E402
+from app.models.appointment_change_model import AppointmentChange  # noqa: E402
+from app.models.risk_event_model import RiskEvent  # noqa: E402
+from app.models.risk_event_action_model import RiskEventAction  # noqa: E402
+from app.models.chat_session_model import ChatSession  # noqa: E402
+from app.models.message_model import Message  # noqa: E402
+from app.models.emotion_analysis_model import EmotionAnalysis  # noqa: E402
+from app.models.session_summary_model import SessionSummary  # noqa: E402
+from app.models.checklist_item_model import ChecklistItem  # noqa: E402
+from app.models.session_checklist_model import SessionChecklist  # noqa: E402
+from app.models.assessment_result_model import AssessmentResult  # noqa: E402
+from app.models.emotion_record_model import EmotionRecord  # noqa: E402
+from app.models.doctor_memo_model import DoctorMemo  # noqa: E402
+from app.models.schedule_model import Schedule  # noqa: E402
 from app.schema.user_schema import UserClaimDTO  # noqa: E402
 from app.util.jwt_token_util import generate_access_token  # noqa: E402
 
@@ -53,8 +54,16 @@ def at(day: date, hour: int, minute: int = 0) -> datetime:
 
 
 async def reset(db) -> None:
-    await db.execute(delete(User).where(User.email.like(f"%{EMAIL_DOMAIN}")))
-    await db.execute(delete(Hospital).where(Hospital.name.like(f"{HOSPITAL_PREFIX}%")))
+    # ON DELETE RESTRICT인 FK가 있어서 참조하는 행부터 지운다.
+    # (schedules.created_by, appointment_changes.changed_by -> users / rooms·appointments·doctor_profiles -> hospitals)
+    test_users = select(User.id).where(User.email.like(f"%{EMAIL_DOMAIN}"))
+    test_hospitals = select(Hospital.hospital_id).where(Hospital.name.like(f"{HOSPITAL_PREFIX}%"))
+
+    await db.execute(delete(Schedule).where(Schedule.created_by.in_(test_users)))
+    await db.execute(delete(AppointmentChange).where(AppointmentChange.changed_by.in_(test_users)))
+    await db.execute(delete(User).where(User.id.in_(test_users)))  # 나머지는 CASCADE
+    await db.execute(delete(Room).where(Room.hospital_id.in_(test_hospitals)))
+    await db.execute(delete(Hospital).where(Hospital.hospital_id.in_(test_hospitals)))
     await db.execute(delete(ChecklistItem).where(ChecklistItem.item_key.like(f"{ITEM_PREFIX}%")))
     await db.commit()
 
@@ -64,8 +73,8 @@ async def seed(db) -> dict[str, User]:
     now = datetime.now(KST)
 
     # ===== 병원·진료실 =====
-    h1 = Hospital(name=f"{HOSPITAL_PREFIX} 마음병원", sido="서울", sigungu="강남구")
-    h2 = Hospital(name=f"{HOSPITAL_PREFIX} 다른병원", sido="부산", sigungu="해운대구")
+    h1 = Hospital(name=f"{HOSPITAL_PREFIX} 마음병원", address="서울 강남구 테헤란로 1", sido="서울", sigungu="강남구")
+    h2 = Hospital(name=f"{HOSPITAL_PREFIX} 다른병원", address="부산 해운대구 해운대로 1", sido="부산", sigungu="해운대구")
     db.add_all([h1, h2])
     await db.flush()
 
@@ -118,7 +127,8 @@ async def seed(db) -> dict[str, User]:
         return Appointment(
             patient_id=patient.id, doctor_id=doctor.id, hospital_id=hospital.hospital_id,
             scheduled_at=start, end_at=start + timedelta(minutes=30), status=status, kind=kind,
-            room_id=room.id if room else None, booking_source="doctor", created_by=doctor.id, **kw
+            room_id=room.id if room else None, booking_source="doctor", created_by=doctor.id,
+            contact_method="phone", **kw
         )
 
     tomorrow, last_month = today + timedelta(days=1), today - timedelta(days=30)
@@ -142,14 +152,14 @@ async def seed(db) -> dict[str, User]:
     await db.flush()
     db.add(AppointmentChange(
         appointment_id=p2_rescheduled.appointment_id, from_at=at(today - timedelta(days=1), 11), to_at=at(today, 11),
-        change_type="reschedule", reason="환자 사정", requested_by="patient", created_at=now - timedelta(days=2)
+        change_type="reschedule", reason="환자 사정", requested_by="patient", changed_by=p2.id, created_at=now - timedelta(days=2)
     ))
 
     # ===== P1 상담 세션 (메시지 16개, 7번에 위험 감지, 감정 분석) =====
     chat_start = now - timedelta(days=2)
     session = ChatSession(
-        user_id=p1.id, status="ended", end_reason="completed", summary_status="ready", session_type="counselling",
-        started_at=chat_start, ended_at=chat_start + timedelta(minutes=40)
+        user_id=p1.id, status="ended", end_reason="completed", summary_status="ready", session_type="counseling",
+        scheduled_at=chat_start, started_at=chat_start, ended_at=chat_start + timedelta(minutes=40)
     )
     db.add(session)
     await db.flush()
@@ -189,29 +199,28 @@ async def seed(db) -> dict[str, User]:
     )
     db.add(summary)
     # 아직 시작 안 한 예정 세션 -> 상담 기록 목록에 안 나와야 함
-    db.add(ChatSession(user_id=p1.id, status="scheduled", session_type="counselling", scheduled_at=now + timedelta(days=3)))
+    db.add(ChatSession(user_id=p1.id, status="scheduled", session_type="counseling", scheduled_at=now + timedelta(days=3)))
     # P2: 요약 없는 세션
-    db.add(ChatSession(user_id=p2.id, status="ended", summary_status="pending", session_type="counselling",
-                       started_at=now - timedelta(days=1), ended_at=now - timedelta(days=1) + timedelta(minutes=20)))
+    db.add(ChatSession(user_id=p2.id, status="ended", summary_status="pending", session_type="counseling",
+                       scheduled_at=now - timedelta(days=1), started_at=now - timedelta(days=1), ended_at=now - timedelta(days=1) + timedelta(minutes=20)))
     await db.flush()
-    session.summary_id = summary.id
 
     # ===== 위험 알림 =====
     p1_high = RiskEvent(
-        user_id=p1.id, message_id=messages[6].id, level="high", source="rule", origin="chat", origin_id=str(session.id),
+        user_id=p1.id, message_id=messages[6].id, level="high", source="rule", origin="chat",
         status="open", evidence="소진·포기 표현", matched_terms=["그만두고 싶다"], context_judgement="자해 의도는 명확하지 않으나 확인 필요",
         category="무기력", score=0.87, model_version="v2", created_at=now - timedelta(hours=2)
     )
     p2_low_reviewed = RiskEvent(
-        user_id=p2.id, level="low", source="emotion", origin="diary", status="reviewed", evidence="우울 감정 지속",
+        user_id=p2.id, level="low", source="classifier", origin="assessment", status="reviewed", evidence="우울 감정 지속",
         reviewed_by=a.id, reviewed_at=now - timedelta(days=2), created_at=now - timedelta(days=3)
     )
     db.add_all([
         p1_high,
         RiskEvent(user_id=p1.id, level="medium", source="classifier", origin="trend", status="open",
                   evidence="최근 7일 점수 상승", created_at=now - timedelta(days=3)),
-        RiskEvent(user_id=p2.id, level="medium", source="llm", origin="assessment", status="open",
-                  evidence="PHQ-9 중등도", created_at=now - timedelta(days=1)),
+        RiskEvent(user_id=p2.id, level="medium", source="classifier", origin="assessment", status="open",
+                  evidence="PHQ-9 중등도", due_at=now + timedelta(hours=23), created_at=now - timedelta(days=1)),
         p2_low_reviewed,
         RiskEvent(user_id=p4.id, level="high", source="rule", origin="chat", status="open",
                   evidence="다른 의사 환자", created_at=now - timedelta(hours=1)),
@@ -227,20 +236,21 @@ async def seed(db) -> dict[str, User]:
     # ===== P1 사전 문진 (체크리스트 + 척도) =====
     intake_start = now - timedelta(days=10)
     intake = ChatSession(user_id=p1.id, status="ended", end_reason="completed", summary_status="ready",
-                         session_type="intake", started_at=intake_start, ended_at=intake_start + timedelta(minutes=25))
+                         session_type="intake", scheduled_at=intake_start, started_at=intake_start, ended_at=intake_start + timedelta(minutes=25))
     db.add(intake)
     await db.flush()
-    db.add(SessionSummary(session_id=intake.id, context_summary="초진 전 사전 문진", chief_complaint="잠을 못 잠, 무기력",
+    db.add(SessionSummary(session_id=intake.id, context_summary="초진 전 사전 문진", mood_summary={"start": "sadness"},
+                          chief_complaint="잠을 못 잠, 무기력",
                           findings={"phq9": "moderate", "isi": "moderate"}))
 
     items = [
-        ChecklistItem(item_key=f"{ITEM_PREFIX}phq9_1", label="흥미나 즐거움이 거의 없음", answer_type="scale",
+        ChecklistItem(item_key=f"{ITEM_PREFIX}phq9_1", label="흥미나 즐거움이 거의 없음", instruction="지난 2주 기준", answer_type="scale",
                       options=[0, 1, 2, 3], instrument="phq9", item_no=1),
-        ChecklistItem(item_key=f"{ITEM_PREFIX}phq9_2", label="기분이 가라앉거나 우울함", answer_type="scale",
+        ChecklistItem(item_key=f"{ITEM_PREFIX}phq9_2", label="기분이 가라앉거나 우울함", instruction="지난 2주 기준", answer_type="scale",
                       options=[0, 1, 2, 3], instrument="phq9", item_no=2),
-        ChecklistItem(item_key=f"{ITEM_PREFIX}gad7_1", label="초조하거나 불안함", answer_type="scale",
+        ChecklistItem(item_key=f"{ITEM_PREFIX}gad7_1", label="초조하거나 불안함", instruction="지난 2주 기준", answer_type="scale",
                       options=[0, 1, 2, 3], instrument="gad7", item_no=1),
-        ChecklistItem(item_key=f"{ITEM_PREFIX}sleep_note", label="수면 관련 자유 기술", answer_type="text"),
+        ChecklistItem(item_key=f"{ITEM_PREFIX}sleep_note", label="수면 관련 자유 기술", instruction="자유롭게", answer_type="text"),
     ]
     db.add_all(items)
     await db.flush()
@@ -249,7 +259,7 @@ async def seed(db) -> dict[str, User]:
         SessionChecklist(session_id=intake.id, item_id=items[0].id, sort_order=1, required=True, status="done", value=3, ask_count=1),
         SessionChecklist(session_id=intake.id, item_id=items[2].id, sort_order=3, required=True, status="skipped",
                          skip_reason="user_declined", ask_count=2),
-        SessionChecklist(session_id=intake.id, item_id=items[3].id, required=False, status="pending"),  # sort_order 없음 -> 맨 뒤
+        SessionChecklist(session_id=intake.id, item_id=items[3].id, sort_order=4, required=False, status="pending"),
     ])
 
     # ===== 척도 결과 (경과 그래프: 4개월, 문진 세션 연결) =====
@@ -271,12 +281,13 @@ async def seed(db) -> dict[str, User]:
     # ===== P1 감정 기록 (최근 2주 + 그 전 1주, 하루 1건, 며칠은 비움) =====
     tags = ["불안", "피곤", "무기력", "불안", None, "괜찮음", "피곤"]
     for offset in range(20, -1, -1):
-        if offset in (4, 9, 15):
+        if offset in (9, 15):
             continue
         day = today - timedelta(days=offset)
         db.add(EmotionRecord(
-            user_id=p1.id, record_date=at(day, 0), mood_score=2 + (20 - offset) % 3 + (1 if offset < 7 else 0),
-            mood_tag=tags[offset % 7], created_at=at(day, [7, 13, 22, 2][offset % 4], 30)
+            user_id=p1.id, record_date=day, mood_score=2 + (20 - offset) % 3 + (1 if offset < 7 else 0),
+            mood_tag=tags[offset % 7], created_at=at(day, [7, 13, 22, 2][offset % 4], 30),
+            is_shared=(offset != 4)   # 4일 전 기록은 공유 안 함 -> 의사 리포트에서 빠져야 함
         ))
 
     # ===== 메모 (메모 팝업 회귀 확인용) =====

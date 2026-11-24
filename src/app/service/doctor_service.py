@@ -4,11 +4,13 @@ from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal
 from fastapi import Depends, HTTPException, status
 from app.repository.doctor_repository import DoctorRepository, get_doctor_repository
-from app.enum.appointment_enum import AppointmentStatus, AppointmentKind, VisitType, BookingSource, ScheduleType
-from app.enum.risk_enum import RiskLevel, RiskStatus, ActorType
-from app.enum.common_enum import Instrument, Emotion
-from app.model.risk_event_model import RiskEvent
-from app.model.appointment_model import Appointment
+from app.enums.appointment_enum import AppointmentStatus, AppointmentKind, AppointmentVisitType, AppointmentBookingSource
+from app.enums.schedule_enum import ScheduleType
+from app.enums.risk_event_enum import RiskEventLevel, RiskEventStatus
+from app.enums.risk_event_action_enum import RiskEventActionActorType
+from app.enums.common_enum import Instrument, EmotionType
+from app.models.risk_event_model import RiskEvent
+from app.models.appointment_model import Appointment
 from app.schema.doctor_schema import (
     DashboardSummaryResponseDTO,
     RoomResponseDTO,
@@ -49,12 +51,12 @@ from app.schema.doctor_schema import (
     AppointmentStatusUpdateDTO,
 )
 from app.schema.common_schema import PageResponseDTO
-from app.model.chat_session_model import ChatSession
+from app.models.chat_session_model import ChatSession
 
 KST = timezone(timedelta(hours=9)) # UTC+9
 
 # 환자 정렬용 위험 등급 순위 (알림 없음 = 0)
-RISK_RANK = {RiskLevel.HIGH: 3, RiskLevel.MEDIUM: 2, RiskLevel.LOW: 1}
+RISK_RANK = {RiskEventLevel.HIGH: 3, RiskEventLevel.MEDIUM: 2, RiskEventLevel.LOW: 1}
 
 # 환자 목록 탭 -> 그날 예약 상태
 TAB_STATUS = {"waiting": AppointmentStatus.WAITING, "booked": AppointmentStatus.BOOKED}
@@ -176,10 +178,13 @@ class DoctorService:
         return RiskEventResponseDTO(
             id=event.id,
             level=event.level,
-            patient=DoctorPatientBriefDTO(id=event.user_id, name=event.user.name if event.user else None),
+            patient=DoctorPatientBriefDTO(id=event.user_id, name=event.patient.name if event.patient else None),
             evidence=event.evidence,
             origin=event.origin,
             status=event.status,
+            is_repeated=event.is_repeated,
+            is_uncertain=event.is_uncertain,
+            due_at=event.due_at,
             created_at=event.created_at,
             reviewed_at=event.reviewed_at
         )
@@ -198,6 +203,7 @@ class DoctorService:
             ),
             visit_type=appointment.visit_type,
             kind=appointment.kind,
+            contact_method=appointment.contact_method,
             room_id=appointment.room_id,
             status=appointment.status
         )
@@ -263,7 +269,7 @@ class DoctorService:
 
         # 환자별 최고 등급 알림 (등급 높은 순 -> 최신순으로 오므로 처음 것이 대표)
         top_risks: dict[int, RiskEvent] = {}
-        for event in await self.repo.find_risk_events(doctor_id, RiskStatus.OPEN, patient_ids):
+        for event in await self.repo.find_risk_events(doctor_id, RiskEventStatus.OPEN, patient_ids):
             top_risks.setdefault(event.user_id, event)
 
         # 탭 필터: 그 상태인 예약이 있는 환자만
@@ -309,7 +315,7 @@ class DoctorService:
 
 
     # 5. 위험 환자 알림 목록
-    async def get_risk_events(self, doctor_id: int, risk_status: RiskStatus) -> list[RiskEventResponseDTO]:
+    async def get_risk_events(self, doctor_id: int, risk_status: RiskEventStatus) -> list[RiskEventResponseDTO]:
         events = await self.repo.find_risk_events(doctor_id, risk_status)
         return [self._to_risk_response(event) for event in events]
 
@@ -329,7 +335,7 @@ class DoctorService:
         if not await self.repo.review_risk_event(event_id, doctor_id):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="이미 확인한 알림입니다."
+                detail="확인 전(open)·보류(on_hold) 알림만 확인할 수 있습니다."
             )
 
         reviewed_event = await self.repo.find_risk_event_by_id(event_id)
@@ -428,7 +434,7 @@ class DoctorService:
         await self._ensure_in_charge(doctor_id, session.user_id)
 
         # 메시지별 가장 높은 위험 등급
-        risk_levels: dict[int, RiskLevel] = {}
+        risk_levels: dict[int, RiskEventLevel] = {}
         for message_id, level in await self.repo.find_message_risk_levels(session_id):
             if RISK_RANK[level] > RISK_RANK.get(risk_levels.get(message_id), 0):
                 risk_levels[message_id] = level
@@ -493,12 +499,12 @@ class DoctorService:
 
         actions = sorted(event.actions, key=lambda a: (a.created_at, a.id))
         names = await self.repo.find_user_names(
-            {a.actor_id for a in actions if a.actor_type == ActorType.DOCTOR and a.actor_id}
+            {a.actor_id for a in actions if a.actor_type == RiskEventActionActorType.DOCTOR and a.actor_id}
         )
 
         return RiskEventDetailResponseDTO(
             id=event.id,
-            patient=DoctorPatientBriefDTO(id=event.user_id, name=event.user.name if event.user else None),
+            patient=DoctorPatientBriefDTO(id=event.user_id, name=event.patient.name if event.patient else None),
             level=event.level,
             status=event.status,
             source=event.source,
@@ -509,6 +515,9 @@ class DoctorService:
             matched_terms=event.matched_terms,
             context_judgement=event.context_judgement,
             model_version=event.model_version,
+            is_repeated=event.is_repeated,
+            is_uncertain=event.is_uncertain,
+            due_at=event.due_at,
             created_at=event.created_at,
             reviewed_at=event.reviewed_at,
             session_id=messages[0].session_id if messages else None,
@@ -522,7 +531,7 @@ class DoctorService:
             actions=[
                 RiskEventActionResponseDTO(
                     id=a.id, actor_type=a.actor_type, actor_id=a.actor_id,
-                    actor_name=names.get(a.actor_id) if a.actor_type == ActorType.DOCTOR else None,
+                    actor_name=names.get(a.actor_id) if a.actor_type == RiskEventActionActorType.DOCTOR else None,
                     action=a.action, memo=a.memo, created_at=a.created_at
                 )
                 for a in actions
@@ -530,8 +539,8 @@ class DoctorService:
         )
 
 
-    # 14. 조치 기록 추가 (note: 메모 / escalate: 위기 대응으로 올림)
-    # - 이미 escalated인 알림에 escalate -> 409
+    # 14. 조치 기록 추가 (note: 메모 / hold: 보류 / escalate: 위기 대응으로 올림)
+    # - 지금 상태에서 할 수 없는 조치 -> 409 (hold는 open만, escalate는 escalated가 아닐 때만)
     async def add_risk_action(
         self, doctor_id: int, event_id: int, action: RiskEventActionCreateDTO
     ) -> RiskEventDetailResponseDTO:
@@ -540,7 +549,7 @@ class DoctorService:
         if not await self.repo.add_risk_action(event_id, doctor_id, action.action, action.memo):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="이미 위기 대응으로 올린 알림입니다."
+                detail=f"지금 상태에서는 {action.action.value} 조치를 할 수 없습니다."
             )
 
         return await self.get_risk_event_detail(doctor_id, event_id)
@@ -549,7 +558,7 @@ class DoctorService:
     # ===== F-04 감정 그래프 팝업 (의사-02·03, 결정-26 미정 -> 임의 결정 D-13) =====
 
     # 15. 감정 리포트 (요약 4칸, 일별 기분, 주별 감정 비율, 키워드, 시간대별 기록)
-    # - 기분 점수·키워드·시간대: 환자가 직접 남긴 감정 기록(emotion_records)
+    # - 기분 점수·키워드·시간대: 환자가 직접 남기고 의사에게 공유한(is_shared) 감정 기록(emotion_records)
     # - 감정 비율·가장 많은 감정: AI 상담 대화의 감정 분석(emotion_analyses)
     # - 일기는 쓰지 않는다 (임의 결정 D-04)
     async def get_emotion_report(
@@ -561,12 +570,12 @@ class DoctorService:
         start_at, end_at = kst_day_range(first_day)[0], kst_day_range(next_day)[0]
         total_days = (next_day - first_day).days
 
-        records = await self.repo.find_emotion_records(patient_id, start_at, end_at)
+        records = await self.repo.find_emotion_records(patient_id, first_day, next_day)
         emotions = await self.repo.find_message_emotions(patient_id, start_at, end_at)
 
         # 요약: 평균 기분, 직전 같은 길이 기간과의 차이
         avg = sum(r.mood_score for r in records) / len(records) if records else None
-        prev_avg = await self.repo.avg_mood_score(patient_id, start_at - (end_at - start_at), start_at)
+        prev_avg = await self.repo.avg_mood_score(patient_id, first_day - (next_day - first_day), first_day)
         emotion_counter = Counter(dominant for _, dominant in emotions)
 
         # 주별 감정 비율 (월요일 시작)
@@ -586,19 +595,19 @@ class DoctorService:
             summary=EmotionSummaryDTO(
                 avg_mood_score=round(avg, 2) if avg is not None else None,
                 mood_change=round(avg - prev_avg, 2) if avg is not None and prev_avg is not None else None,
-                recorded_days=len({r.record_date.astimezone(KST).date() for r in records}),
+                recorded_days=len({r.record_date for r in records}),
                 total_days=total_days,
                 top_emotion=emotion_counter.most_common(1)[0][0] if emotion_counter else None
             ),
             daily_moods=[
-                DailyMoodDTO(date=r.record_date.astimezone(KST).date(), mood_score=r.mood_score, mood_tag=r.mood_tag)
+                DailyMoodDTO(date=r.record_date, mood_score=r.mood_score, mood_tag=r.mood_tag)
                 for r in records
             ],
             weekly_emotions=[
                 WeeklyEmotionDTO(
                     week_start=week_start,
                     total=sum(counter.values()),
-                    ratios={e: round(counter[e] / sum(counter.values()), 3) for e in Emotion}
+                    ratios={e: round(counter[e] / sum(counter.values()), 3) for e in EmotionType}
                 )
                 for week_start, counter in sorted(weeks.items())
             ],
@@ -791,10 +800,11 @@ class DoctorService:
                 "end_at": end,
                 "status": AppointmentStatus.BOOKED,
                 "kind": request.kind,
+                "contact_method": request.contact_method,
                 "tests": request.tests,
-                "visit_type": VisitType.RETURN if visited else VisitType.FIRST,
+                "visit_type": AppointmentVisitType.RETURN if visited else AppointmentVisitType.FIRST,
                 "room_id": request.room_id,
-                "booking_source": BookingSource.DOCTOR,
+                "booking_source": AppointmentBookingSource.DOCTOR,
                 "created_by": doctor_id
             },
             schedule_type,

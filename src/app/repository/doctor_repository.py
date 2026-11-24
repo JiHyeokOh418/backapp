@@ -1,40 +1,55 @@
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from app.infrastructure.postgresql import get_postgresql_db
 from fastapi import Depends
 
 # 모델, ORM
-from app.model.user_model import User
-from app.model.care_relation_model import CareRelation
-from app.model.doctor_profile_model import DoctorProfile
-from app.model.room_model import Room
-from app.model.appointment_model import Appointment
-from app.model.risk_event_model import RiskEvent
-from app.model.risk_event_action_model import RiskEventAction
-from app.model.assessment_result_model import AssessmentResult
-from app.model.chat_session_model import ChatSession
-from app.model.message_model import Message
-from app.model.emotion_record_model import EmotionRecord
-from app.model.emotion_analysis_model import EmotionAnalysis
-from app.model.session_checklist_model import SessionChecklist
-from app.model.appointment_change_model import AppointmentChange
-from app.model.schedule_model import Schedule
-from app.enum.appointment_enum import AppointmentStatus, AppointmentKind, ChangeType, RequestedBy, ScheduleType
-from app.enum.risk_enum import RiskLevel, RiskStatus, ActorType, RiskAction
-from app.enum.common_enum import Instrument
-from app.enum.chat_enum import MessageRole, SessionType
+from app.models.user_model import User
+from app.models.care_relation_model import CareRelation
+from app.models.doctor_profile_model import DoctorProfile
+from app.models.room_model import Room
+from app.models.appointment_model import Appointment
+from app.models.risk_event_model import RiskEvent
+from app.models.risk_event_action_model import RiskEventAction
+from app.models.assessment_result_model import AssessmentResult
+from app.models.chat_session_model import ChatSession
+from app.models.message_model import Message
+from app.models.emotion_record_model import EmotionRecord
+from app.models.emotion_analysis_model import EmotionAnalysis
+from app.models.session_checklist_model import SessionChecklist
+from app.models.appointment_change_model import AppointmentChange
+from app.models.schedule_model import Schedule
+from app.enums.appointment_enum import AppointmentStatus, AppointmentKind
+from app.enums.appointment_change_enum import AppointmentChangeType
+from app.enums.common_enum import Instrument, RequestedBy
+from app.enums.schedule_enum import ScheduleType
+from app.enums.risk_event_enum import RiskEventLevel, RiskEventStatus
+from app.enums.risk_event_action_enum import RiskEventActionActorType, RiskEventActionAction
+from app.enums.chat_session_enum import ChatSessionType
+from app.enums.message_enum import MessageRole
 from sqlalchemy import select, update, insert, delete, func, case, exists, or_
 
 KST = timezone(timedelta(hours=9)) # UTC+9
 
 # 위험 등급 정렬용 (high가 가장 위)
 RISK_LEVEL_ORDER = case(
-    (RiskEvent.level == RiskLevel.HIGH, 3),
-    (RiskEvent.level == RiskLevel.MEDIUM, 2),
-    (RiskEvent.level == RiskLevel.LOW, 1),
+    (RiskEvent.level == RiskEventLevel.HIGH, 3),
+    (RiskEvent.level == RiskEventLevel.MEDIUM, 2),
+    (RiskEvent.level == RiskEventLevel.LOW, 1),
     else_=0
 )
+
+
+# 의사 조치 -> (바뀔 상태, 바꿀 수 있는 지금 상태)  (임의 결정 D-07·D-08, 팀 enum의 on_hold·hold 반영)
+# - review: 확인 / hold: 보류 / escalate: 위기 대응으로 올림 / note: 메모만 (상태 그대로)
+RISK_TRANSITIONS = {
+    RiskEventActionAction.REVIEW: (RiskEventStatus.REVIEWED, (RiskEventStatus.OPEN, RiskEventStatus.ON_HOLD)),
+    RiskEventActionAction.HOLD: (RiskEventStatus.ON_HOLD, (RiskEventStatus.OPEN,)),
+    RiskEventActionAction.ESCALATE: (
+        RiskEventStatus.ESCALATED, (RiskEventStatus.OPEN, RiskEventStatus.REVIEWED, RiskEventStatus.ON_HOLD)
+    ),
+}
 
 
 # 내가 지금 담당 중인 환자 id 서브쿼리 (담당이 끝난 관계 제외)
@@ -98,7 +113,7 @@ class DoctorRepository:
         query = (
             select(func.count(RiskEvent.id))
             .where(
-                RiskEvent.status == RiskStatus.OPEN,
+                RiskEvent.status == RiskEventStatus.OPEN,
                 RiskEvent.user_id.in_(care_patient_ids(doctor_id))
             )
         )
@@ -168,11 +183,11 @@ class DoctorRepository:
     # 8. 위험 알림 목록 (담당 환자, 등급 높은 순 -> 최신순)
     # - patient_ids를 주면 그 환자들 것만
     async def find_risk_events(
-        self, doctor_id: int, status: RiskStatus, patient_ids: list[int] | None = None
+        self, doctor_id: int, status: RiskEventStatus, patient_ids: list[int] | None = None
     ) -> list[RiskEvent]:
         query = (
             select(RiskEvent)
-            .options(selectinload(RiskEvent.user))
+            .options(selectinload(RiskEvent.patient))
             .where(
                 RiskEvent.status == status,
                 RiskEvent.user_id.in_(care_patient_ids(doctor_id))
@@ -192,7 +207,7 @@ class DoctorRepository:
     async def find_risk_event_by_id(self, event_id: int) -> RiskEvent | None:
         query = (
             select(RiskEvent)
-            .options(selectinload(RiskEvent.user))
+            .options(selectinload(RiskEvent.patient))
             .where(RiskEvent.id == event_id)
             .execution_options(populate_existing=True)
         )
@@ -202,39 +217,24 @@ class DoctorRepository:
 
 
     # 10. 위험 알림 확인 처리 + 조치 이력 1건 (한 트랜잭션)
-    # - status=open인 경우에만 바꾼다. 동시에 두 번 눌러도 1번만 성공한다.
+    # - open·on_hold인 경우에만 바꾼다. 동시에 두 번 눌러도 1번만 성공한다.
     # - 조치 이력은 추가만 한다. (판단-13·14: 수정·삭제 없음)
     async def review_risk_event(self, event_id: int, doctor_id: int) -> bool:
-        now = datetime.now(KST)
-        query = (
+        return await self.add_risk_action(event_id, doctor_id, RiskEventActionAction.REVIEW, None)
+
+
+    # 위험 알림 상태 변경 (RISK_TRANSITIONS 규칙, 지금 상태가 맞을 때만) -> 바뀌었으면 True
+    async def _change_risk_status(self, event_id: int, doctor_id: int, action: RiskEventActionAction, now: datetime) -> bool:
+        to_status, from_statuses = RISK_TRANSITIONS[action]
+        result = await self.db.execute(
             update(RiskEvent)
             .where(
                 RiskEvent.id == event_id,
-                RiskEvent.status == RiskStatus.OPEN
+                RiskEvent.status.in_(from_statuses)
             )
-            .values(
-                status=RiskStatus.REVIEWED,
-                reviewed_by=doctor_id,
-                reviewed_at=now
-            )
+            .values(status=to_status, reviewed_by=doctor_id, reviewed_at=now)
         )
-
-        result = await self.db.execute(query)
-        if result.rowcount == 0:
-            await self.db.rollback()
-            return False
-
-        await self.db.execute(
-            insert(RiskEventAction).values(
-                risk_event_id=event_id,
-                actor_type=ActorType.DOCTOR,
-                actor_id=doctor_id,
-                action=RiskAction.REVIEW,
-                created_at=now
-            )
-        )
-        await self.db.commit()
-        return True
+        return result.rowcount > 0
 
 
     # 11. 월 캘린더: 날짜(KST)별 진료·검사 개수 (취소 제외)
@@ -359,7 +359,7 @@ class DoctorRepository:
     async def find_patient_risk_events(self, patient_id: int, since: datetime) -> list[RiskEvent]:
         query = (
             select(RiskEvent)
-            .options(selectinload(RiskEvent.user))
+            .options(selectinload(RiskEvent.patient))
             .where(
                 RiskEvent.user_id == patient_id,
                 RiskEvent.created_at >= since
@@ -376,7 +376,7 @@ class DoctorRepository:
     async def find_risk_event_detail(self, event_id: int) -> RiskEvent | None:
         query = (
             select(RiskEvent)
-            .options(selectinload(RiskEvent.user), selectinload(RiskEvent.actions))
+            .options(selectinload(RiskEvent.patient), selectinload(RiskEvent.actions))
             .where(RiskEvent.id == event_id)
             .execution_options(populate_existing=True)
         )
@@ -413,33 +413,20 @@ class DoctorRepository:
         return {user_id: name for user_id, name in result.all()}
 
 
-    # 21. 의사 조치 기록 추가
-    # - escalate면 상태를 escalated로 바꾼다. 이미 escalated면 아무것도 하지 않고 False (동시에 눌러도 1번만)
+    # 21. 의사 조치 기록 추가 (review·hold·escalate는 상태도 바꾼다, note는 이력만)
+    # - 지금 상태에서 그 조치를 할 수 없으면 아무것도 하지 않고 False (동시에 눌러도 1번만)
     # - 조치 이력은 추가만 한다. (판단-13·14: 수정·삭제 없음)
-    async def add_risk_action(self, event_id: int, doctor_id: int, action: RiskAction, memo: str | None) -> bool:
+    async def add_risk_action(self, event_id: int, doctor_id: int, action: RiskEventActionAction, memo: str | None) -> bool:
         now = datetime.now(KST)
 
-        if action == RiskAction.ESCALATE:
-            result = await self.db.execute(
-                update(RiskEvent)
-                .where(
-                    RiskEvent.id == event_id,
-                    RiskEvent.status != RiskStatus.ESCALATED
-                )
-                .values(
-                    status=RiskStatus.ESCALATED,
-                    reviewed_by=doctor_id,
-                    reviewed_at=now
-                )
-            )
-            if result.rowcount == 0:
-                await self.db.rollback()
-                return False
+        if action in RISK_TRANSITIONS and not await self._change_risk_status(event_id, doctor_id, action, now):
+            await self.db.rollback()
+            return False
 
         await self.db.execute(
             insert(RiskEventAction).values(
                 risk_event_id=event_id,
-                actor_type=ActorType.DOCTOR,
+                actor_type=RiskEventActionActorType.DOCTOR,
                 actor_id=doctor_id,
                 action=action,
                 memo=memo,
@@ -452,15 +439,23 @@ class DoctorRepository:
 
     # ===== F-04 감정 그래프 팝업 =====
 
-    # 22. 감정 기록 (기간 안, 날짜순)
-    async def find_emotion_records(self, patient_id: int, start: datetime, end: datetime) -> list[EmotionRecord]:
+    # 의사에게 보여 줄 감정 기록 조건: 그 환자, 의사에게 공유함(is_shared), 삭제 안 함
+    @staticmethod
+    def _shared_emotion_records(patient_id: int, start: date, end: date) -> tuple:
+        return (
+            EmotionRecord.user_id == patient_id,
+            EmotionRecord.is_shared.is_(True),
+            EmotionRecord.deleted_at.is_(None),
+            EmotionRecord.record_date >= start,
+            EmotionRecord.record_date < end
+        )
+
+
+    # 22. 감정 기록 (기간 [start, end) 날짜, 날짜순)
+    async def find_emotion_records(self, patient_id: int, start: date, end: date) -> list[EmotionRecord]:
         query = (
             select(EmotionRecord)
-            .where(
-                EmotionRecord.user_id == patient_id,
-                EmotionRecord.record_date >= start,
-                EmotionRecord.record_date < end
-            )
+            .where(*self._shared_emotion_records(patient_id, start, end))
             .order_by(EmotionRecord.record_date, EmotionRecord.emotion_id)
         )
 
@@ -469,14 +464,10 @@ class DoctorRepository:
 
 
     # 23. 기간 평균 기분 점수 (기록 없으면 None)
-    async def avg_mood_score(self, patient_id: int, start: datetime, end: datetime) -> float | None:
+    async def avg_mood_score(self, patient_id: int, start: date, end: date) -> float | None:
         query = (
             select(func.avg(EmotionRecord.mood_score))
-            .where(
-                EmotionRecord.user_id == patient_id,
-                EmotionRecord.record_date >= start,
-                EmotionRecord.record_date < end
-            )
+            .where(*self._shared_emotion_records(patient_id, start, end))
         )
 
         result = await self.db.execute(query)
@@ -519,7 +510,7 @@ class DoctorRepository:
             )
             .where(
                 ChatSession.user_id == patient_id,
-                ChatSession.session_type == SessionType.INTAKE
+                ChatSession.session_type == ChatSessionType.INTAKE
             )
         )
 
@@ -554,7 +545,7 @@ class DoctorRepository:
             select(ChatSession)
             .where(
                 ChatSession.user_id == patient_id,
-                ChatSession.session_type == SessionType.INTAKE,
+                ChatSession.session_type == ChatSessionType.INTAKE,
                 ChatSession.started_at.is_not(None)
             )
             .order_by(ChatSession.started_at.desc(), ChatSession.id.desc())
@@ -618,7 +609,7 @@ class DoctorRepository:
         )
 
         result = await self.db.execute(
-            select(change_count(ChangeType.RESCHEDULE), change_count(ChangeType.CANCEL), no_show_count)
+            select(change_count(AppointmentChangeType.RESCHEDULE), change_count(AppointmentChangeType.CANCEL), no_show_count)
         )
         reschedule_count, cancel_count, no_shows = result.one()
         return reschedule_count, cancel_count, no_shows
@@ -728,7 +719,7 @@ class DoctorRepository:
                 appointment_id=appointment_id,
                 from_at=from_at,
                 to_at=start,
-                change_type=ChangeType.RESCHEDULE,
+                change_type=AppointmentChangeType.RESCHEDULE,
                 reason=reason,
                 requested_by=RequestedBy.DOCTOR,
                 changed_by=doctor_id,
@@ -764,7 +755,7 @@ class DoctorRepository:
             insert(AppointmentChange).values(
                 appointment_id=appointment_id,
                 from_at=from_at,
-                change_type=ChangeType.CANCEL,
+                change_type=AppointmentChangeType.CANCEL,
                 reason=reason,
                 requested_by=RequestedBy.DOCTOR,
                 changed_by=doctor_id,

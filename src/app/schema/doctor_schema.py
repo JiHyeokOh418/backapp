@@ -1,13 +1,17 @@
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Literal
 from pydantic import PlainSerializer, Field, field_validator, model_validator, AwareDatetime
-from app.enum.appointment_enum import AppointmentStatus, AppointmentKind, VisitType, ChangeType, RequestedBy
-from app.enum.hospital_enum import RoomType
-from app.enum.risk_enum import RiskLevel, RiskStatus, RiskOrigin, RiskSource, RiskAction, ActorType
-from app.enum.user_enum import Gender
-from app.enum.common_enum import Instrument, Emotion
-from app.enum.chat_enum import SessionType, SessionStatus, SummaryStatus, SessionEndReason, MessageRole
-from app.enum.checklist_enum import AnswerType, ChecklistStatus, SkipReason
+from app.enums.appointment_enum import AppointmentStatus, AppointmentKind, AppointmentVisitType, AppointmentContactMethod
+from app.enums.appointment_change_enum import AppointmentChangeType
+from app.enums.common_enum import Instrument, EmotionType, ChecklistStatus, RequestedBy
+from app.enums.room_enum import RoomType
+from app.enums.risk_event_enum import RiskEventLevel, RiskEventStatus, RiskEventOrigin, RiskEventSource
+from app.enums.risk_event_action_enum import RiskEventActionAction, RiskEventActionActorType
+from app.enums.user_enum import UserGender
+from app.enums.chat_session_enum import ChatSessionType, ChatSessionStatus, ChatSessionSummaryStatus, ChatSessionEndReason
+from app.enums.message_enum import MessageRole
+from app.enums.checklist_item_enum import ChecklistItemAnswerType
+from app.enums.session_checklist_enum import SessionChecklistSkipReason
 from app.schema.common_schema import BaseDTO
 
 KST = timezone(timedelta(hours=9)) # UTC+9
@@ -49,9 +53,9 @@ class PatientAppointmentDTO(BaseDTO):
 class DoctorPatientResponseDTO(BaseDTO):
     id: int
     name: str | None = None
-    gender: Gender | None = None
+    gender: UserGender | None = None
     birth_date: date | None = None
-    risk_level: RiskLevel | None = None             # 확인 안 한 알림 중 가장 높은 등급 (없으면 null)
+    risk_level: RiskEventLevel | None = None             # 확인 안 한 알림 중 가장 높은 등급 (없으면 null)
     appointment: PatientAppointmentDTO | None = None  # 그날 예약 (없으면 null)
 
 
@@ -61,8 +65,9 @@ class DoctorAppointmentResponseDTO(BaseDTO):
     scheduled_at: KstDateTime
     end_at: KstDateTime | None = None
     patient: DoctorPatientBriefDTO
-    visit_type: VisitType | None = None
+    visit_type: AppointmentVisitType | None = None
     kind: AppointmentKind
+    contact_method: AppointmentContactMethod   # phone: 전화 / chat: 채팅
     room_id: int | None = None
     status: AppointmentStatus
 
@@ -70,11 +75,14 @@ class DoctorAppointmentResponseDTO(BaseDTO):
 # 5. 위험 환자 알림
 class RiskEventResponseDTO(BaseDTO):
     id: int
-    level: RiskLevel
+    level: RiskEventLevel
     patient: DoctorPatientBriefDTO
     evidence: str | None = None     # 사유
-    origin: RiskOrigin
-    status: RiskStatus
+    origin: RiskEventOrigin
+    status: RiskEventStatus
+    is_repeated: bool = False         # 같은 신호가 되풀이됨 (판단-05)
+    is_uncertain: bool = False        # 판단이 확실하지 않음 (판단-06)
+    due_at: KstDateTime | None = None  # 처리 기한 (medium: 감지 + 24시간)
     created_at: KstDateTime
     reviewed_at: KstDateTime | None = None
 
@@ -116,11 +124,11 @@ class AssessmentTrendResponseDTO(BaseDTO):
 # 8. AI 상담 기록 위젯 - 세션 1건
 class ChatRecordResponseDTO(BaseDTO):
     id: int
-    session_type: SessionType          # counselling: 상담 / intake: 사전 문진
-    status: SessionStatus
+    session_type: ChatSessionType          # counseling: 상담 / intake: 사전 문진
+    status: ChatSessionStatus
     started_at: KstDateTime | None = None
     ended_at: KstDateTime | None = None
-    summary_status: SummaryStatus      # 요약이 아직 없으면 pending
+    summary_status: ChatSessionSummaryStatus | None = None  # 요약 상태 (요약을 만들기 전이면 null일 수 있음)
     preview: str | None = None         # 요약 앞부분 (session_summaries.context_summary)
     topics: dict | list | None = None  # 요약 태그
     has_risk: bool                     # 이 세션 대화에서 위험 감지가 있었는지
@@ -132,7 +140,7 @@ class ChatRecordResponseDTO(BaseDTO):
 # 메시지 1건의 감정 분석 (0~1 점수, dominant = 가장 강한 감정)
 # - DB는 Numeric(Decimal)이지만 JSON에서 문자열이 되지 않도록 float로 내려준다.
 class MessageEmotionDTO(BaseDTO):
-    dominant: Emotion
+    dominant: EmotionType
     anger: float
     joy: float
     anxiety: float
@@ -149,7 +157,7 @@ class ChatMessageResponseDTO(BaseDTO):
     content: str
     created_at: KstDateTime
     emotion: MessageEmotionDTO | None = None  # 감정 분석이 없으면 null
-    risk_level: RiskLevel | None = None       # 이 메시지에서 위험이 감지됐으면 가장 높은 등급
+    risk_level: RiskEventLevel | None = None       # 이 메시지에서 위험이 감지됐으면 가장 높은 등급
 
 
 # 세션 사후 요약
@@ -166,12 +174,12 @@ class ChatSummaryDTO(BaseDTO):
 class ChatSessionDetailResponseDTO(BaseDTO):
     id: int
     patient: DoctorPatientBriefDTO
-    session_type: SessionType
-    status: SessionStatus
-    end_reason: SessionEndReason | None = None
+    session_type: ChatSessionType
+    status: ChatSessionStatus
+    end_reason: ChatSessionEndReason | None = None
     started_at: KstDateTime | None = None
     ended_at: KstDateTime | None = None
-    summary_status: SummaryStatus
+    summary_status: ChatSessionSummaryStatus | None = None
     summary: ChatSummaryDTO | None = None
     messages: list[ChatMessageResponseDTO]
 
@@ -192,10 +200,10 @@ class RiskContextMessageDTO(BaseDTO):
 # 조치 이력 1건
 class RiskEventActionResponseDTO(BaseDTO):
     id: int
-    actor_type: ActorType           # ai / system / doctor
+    actor_type: RiskEventActionActorType           # ai / system / doctor
     actor_id: int | None = None
     actor_name: str | None = None   # 의사가 한 조치면 의사 이름
-    action: RiskAction
+    action: RiskEventActionAction
     memo: str | None = None
     created_at: KstDateTime
 
@@ -204,16 +212,19 @@ class RiskEventActionResponseDTO(BaseDTO):
 class RiskEventDetailResponseDTO(BaseDTO):
     id: int
     patient: DoctorPatientBriefDTO
-    level: RiskLevel
-    status: RiskStatus
-    source: RiskSource                      # rule / llm / emotion / classifier / guard
-    origin: RiskOrigin                      # chat / diary / assessment / trend / inactive
+    level: RiskEventLevel
+    status: RiskEventStatus
+    source: RiskEventSource                      # rule / llm / emotion / classifier / guard
+    origin: RiskEventOrigin                      # chat / diary / assessment / trend / inactive
     category: str | None = None
     score: float | None = None
     evidence: str | None = None             # 사유
     matched_terms: dict | list | None = None  # 걸린 단어
     context_judgement: str | None = None    # AI 문맥 판단
     model_version: str | None = None
+    is_repeated: bool = False
+    is_uncertain: bool = False
+    due_at: KstDateTime | None = None
     created_at: KstDateTime
     reviewed_at: KstDateTime | None = None
     session_id: int | None = None           # 대화에서 감지됐으면 그 세션 (상담 내역 팝업으로 이동용)
@@ -222,10 +233,12 @@ class RiskEventDetailResponseDTO(BaseDTO):
 
 
 # 조치 기록 추가 요청
-# - note: 메모만 남김 (상태 그대로, "보류"도 이것으로 남긴다)
-# - escalate: 위기 대응으로 올림 (상태 -> escalated)
+# - note: 메모만 남김 (상태 그대로)
+# - hold: 보류 (open -> on_hold)
+# - escalate: 위기 대응으로 올림 (open·reviewed·on_hold -> escalated)
+# - 확인(review)은 POST /risk-events/{id}/review
 class RiskEventActionCreateDTO(BaseDTO):
-    action: Literal[RiskAction.NOTE, RiskAction.ESCALATE]
+    action: Literal[RiskEventActionAction.NOTE, RiskEventActionAction.HOLD, RiskEventActionAction.ESCALATE]
     memo: str | None = Field(default=None, max_length=500)
 
     @field_validator("memo")
@@ -238,7 +251,7 @@ class RiskEventActionCreateDTO(BaseDTO):
     # note는 메모가 꼭 있어야 한다.
     @model_validator(mode="after")
     def require_memo_for_note(self):
-        if self.action == RiskAction.NOTE and not self.memo:
+        if self.action == RiskEventActionAction.NOTE and not self.memo:
             raise ValueError("메모를 입력하세요.")
         return self
 
@@ -252,7 +265,7 @@ class EmotionSummaryDTO(BaseDTO):
     mood_change: float | None = None      # 직전 같은 길이 기간 평균과의 차이 (+면 좋아짐)
     recorded_days: int                    # 감정 기록이 있는 날 수
     total_days: int                       # 기간 일수
-    top_emotion: Emotion | None = None    # AI 상담 대화에서 가장 많이 나온 감정
+    top_emotion: EmotionType | None = None    # AI 상담 대화에서 가장 많이 나온 감정
 
 
 # 일별 기분 (감정 기록 체크인)
@@ -266,7 +279,7 @@ class DailyMoodDTO(BaseDTO):
 class WeeklyEmotionDTO(BaseDTO):
     week_start: date
     total: int                       # 그 주 분석된 메시지 수
-    ratios: dict[Emotion, float]     # 감정별 비율 (합 1.0)
+    ratios: dict[EmotionType, float]     # 감정별 비율 (합 1.0)
 
 
 # 키워드 (기분 태그 빈도)
@@ -311,18 +324,18 @@ class IntakeAnswerDTO(BaseDTO):
     label: str                              # 문항 이름
     instrument: Instrument | None = None    # 척도 문항이면 척도 (일반 문진 문항이면 null)
     item_no: int | None = None              # 척도 문항 번호
-    answer_type: AnswerType
+    answer_type: ChecklistItemAnswerType
     options: dict | list | None = None      # 보기
     required: bool
     status: ChecklistStatus                 # pending: 안 물어봄 / done: 답함 / skipped: 건너뜀
-    skip_reason: SkipReason | None = None
+    skip_reason: SessionChecklistSkipReason | None = None
     value: dict | list | int | float | str | bool | None = None  # 답 (JSONB 그대로)
 
 
 # 다른 문진으로 바꿔 보기 위한 목록 1건
 class IntakeSessionBriefDTO(BaseDTO):
     id: int
-    status: SessionStatus
+    status: ChatSessionStatus
     started_at: KstDateTime | None = None
 
 
@@ -330,7 +343,7 @@ class IntakeSessionBriefDTO(BaseDTO):
 class IntakeResultResponseDTO(BaseDTO):
     patient: DoctorPatientBriefDTO
     session_id: int
-    status: SessionStatus
+    status: ChatSessionStatus
     started_at: KstDateTime | None = None
     ended_at: KstDateTime | None = None
     scores: list[IntakeScoreDTO]            # phq9, gad7, isi 순서로 항상 3장
@@ -347,7 +360,7 @@ class IntakeResultResponseDTO(BaseDTO):
 # 예약 변경 이력 1건
 class AppointmentChangeResponseDTO(BaseDTO):
     id: int
-    change_type: ChangeType          # reschedule: 일정 변경 / cancel: 취소
+    change_type: AppointmentChangeType          # reschedule: 일정 변경 / cancel: 취소
     from_at: KstDateTime | None = None
     to_at: KstDateTime | None = None
     reason: str | None = None
@@ -380,6 +393,7 @@ class AppointmentCreateDTO(BaseDTO):
     scheduled_at: AwareDatetime
     end_at: AwareDatetime | None = None      # 없으면 시작 + 30분 (임의 결정 D-22)
     kind: AppointmentKind = AppointmentKind.TREATMENT
+    contact_method: AppointmentContactMethod = AppointmentContactMethod.PHONE  # 없으면 전화 (임의 결정 D-29)
     room_id: int | None = None
     tests: list[str] | None = None           # 검사 목록 (예: ["phq9", "gad7"])
 

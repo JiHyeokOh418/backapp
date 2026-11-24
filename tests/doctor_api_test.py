@@ -136,7 +136,7 @@ async def run(c: httpx.AsyncClient, users: dict) -> None:
 
     s, d = await get(f"/doctor/patients/{p1.id}/records")
     check("AI 상담 기록: 시작된 세션 2개, 최신 상담 hasRisk", s == 200 and len(d) == 2 and d[0]["hasRisk"] is True
-          and d[0]["sessionType"] == "counselling" and d[0]["preview"] and d[1]["sessionType"] == "intake", d)
+          and d[0]["sessionType"] == "counseling" and d[0]["preview"] and d[1]["sessionType"] == "intake", d)
     s, _ = await get(f"/doctor/patients/{p1.id}/records", tab="diary")
     check("AI 상담 기록: 일기 탭 -> 501", s == 501, s)
     counsel_id = d[0]["id"]
@@ -175,15 +175,25 @@ async def run(c: httpx.AsyncClient, users: dict) -> None:
     check("조치: escalate -> escalated", s == 201 and d["status"] == "escalated", d)
     s, _ = await send("POST", f"/doctor/risk-events/{high_id}/actions", {"action": "escalate"})
     check("조치: escalate 두 번 -> 409", s == 409, s)
+    s, _ = await send("POST", f"/doctor/risk-events/{high_id}/actions", {"action": "hold"})
+    check("조치: escalated 알림 hold -> 409", s == 409, s)
     s, _ = await send("POST", f"/doctor/risk-events/{high_id}/review")
     check("확인: escalated 알림 review -> 409", s == 409, s)
     n = await scalar("select count(*) from risk_event_actions where risk_event_id = :i", i=high_id)
     check("DB: 조치 이력 4행 (ai, system, note, escalate)", n == 4, n)
 
     s, d = await get("/doctor/risk-events")
-    p2_medium_id = next(e["id"] for e in d if e["patient"]["id"] == p2.id)
+    p2_medium = next(e for e in d if e["patient"]["id"] == p2.id)
+    p2_medium_id = p2_medium["id"]
+    check("위험 알림: 처리 기한(dueAt)·반복/불확실 표시 필드", p2_medium["dueAt"] and p2_medium["isRepeated"] is False and p2_medium["isUncertain"] is False, p2_medium)
+    s, d = await send("POST", f"/doctor/risk-events/{p2_medium_id}/actions", {"action": "hold", "memo": "다음 진료 때 확인"})
+    check("조치: hold -> on_hold, 이력 hold", s == 201 and d["status"] == "on_hold" and d["actions"][-1]["action"] == "hold", d)
+    s, d = await get("/doctor/risk-events", status="on_hold")
+    check("위험 알림 on_hold 목록: 1건", s == 200 and [e["id"] for e in d] == [p2_medium_id], d)
+    s, _ = await send("POST", f"/doctor/risk-events/{p2_medium_id}/actions", {"action": "hold"})
+    check("조치: hold 두 번 -> 409", s == 409, s)
     s, d = await send("POST", f"/doctor/risk-events/{p2_medium_id}/review")
-    check("확인: review -> reviewed", s == 200 and d["status"] == "reviewed" and d["reviewedAt"], d)
+    check("확인: 보류 알림 review -> reviewed", s == 200 and d["status"] == "reviewed" and d["reviewedAt"], d)
     s, _ = await send("POST", f"/doctor/risk-events/{p2_medium_id}/review")
     check("확인: 두 번 -> 409", s == 409, s)
     r1, r2 = await asyncio.gather(

@@ -25,8 +25,8 @@ from app.schema.doctor_schema import (
     AppointmentStatusUpdateDTO,
 )
 from app.schema.common_schema import ApiResponseDTO, PageRequestDTO, PageResponseDTO
-from app.enum.risk_enum import RiskStatus
-from app.enum.common_enum import Instrument
+from app.enums.risk_event_enum import RiskEventStatus
+from app.enums.common_enum import Instrument
 from app.dependencie.auth_dependency import get_current_doctor
 
 
@@ -149,7 +149,7 @@ async def get_appointments(
     responses={403: NOT_DOCTOR}
 )
 async def get_risk_events(
-    status: RiskStatus = Query(default=RiskStatus.OPEN, description="open: 확인 전 / reviewed: 확인함 / escalated: 상향"),
+    status: RiskEventStatus = Query(default=RiskEventStatus.OPEN, description="open: 확인 전 / on_hold: 보류 / reviewed: 확인함 / escalated: 상향"),
     current_doctor: UserClaimDTO = Depends(get_current_doctor),
     doctor_service: DoctorService = Depends(get_doctor_service)
 ):
@@ -170,7 +170,7 @@ async def get_risk_events(
     responses={
         403: NOT_IN_CHARGE,
         404: error_example("알림 없음", "위험 알림이 존재하지 않습니다."),
-        409: error_example("이미 확인한 알림", "이미 확인한 알림입니다.")
+        409: error_example("이미 확인한 알림", "확인 전(open)·보류(on_hold) 알림만 확인할 수 있습니다.")
     }
 )
 async def review_risk_event(
@@ -360,13 +360,13 @@ async def get_risk_event_detail(
 # - 응답은 갱신된 감지 상세 (상태·조치 이력을 팝업에 바로 다시 그릴 수 있게)
 @router.post(
     "/risk-events/{event_id}/actions",
-    summary="위험 조치 기록 추가 (note·escalate)",
+    summary="위험 조치 기록 추가 (note·hold·escalate)",
     status_code=status.HTTP_201_CREATED,
     response_model=ApiResponseDTO[RiskEventDetailResponseDTO],
     responses={
         403: NOT_IN_CHARGE,
         404: RISK_NOT_FOUND,
-        409: error_example("이미 위기 대응으로 올린 알림", "이미 위기 대응으로 올린 알림입니다.")
+        409: error_example("지금 상태에서 할 수 없는 조치", "지금 상태에서는 escalate 조치를 할 수 없습니다.")
     }
 )
 async def add_risk_action(
