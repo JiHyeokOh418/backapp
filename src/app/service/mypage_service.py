@@ -13,6 +13,17 @@ from app.schema.mypage_schema import (
 
 KST = timezone(timedelta(hours=9)) # UTC+9
 
+# 바뀌면 consent_updated_at(동의 변경 시각)을 남기는 설정 (공유·동의)
+CONSENT_FIELDS = {"share_report", "share_diary", "diary_ai_consent"}
+
+
+# 만 나이 계산 - 생일이 지나야 1 늘어난다 (내정보-01)
+def calc_age(birth_date, today):
+    if birth_date is None:
+        return None
+    before_birthday = (today.month, today.day) < (birth_date.month, birth_date.day)
+    return today.year - birth_date.year - (1 if before_birthday else 0)
+
 
 # 마이페이지 비즈니스 로직, 예외 처리, 트랜잭션 관리
 class MypageService:
@@ -72,6 +83,23 @@ class MypageService:
             for relation, doctor in relations
         ]
 
+        #연결된 진료 카드에 병원, 다음 진료를 채운다.
+        now = datetime.now(KST)
+        rows = await self.repo.find_linked_doctors_with_hospital(user_id)
+        hospitals = {doctor.id: hospital for _, doctor, hospital in rows}
+        for linked in linked_doctors:
+            hospital = hospitals.get(linked.doctor_id)
+            linked.hospital_id = hospital.hospital_id if hospital else None
+            linked.hospital_name = hospital.name if hospital else None
+            linked.next_appointment_at = await self.repo.find_next_appointment_at(
+                user_id, linked.doctor_id, now
+            )
+
+        # 가입일·가입한 지 N일째 (가입한 날 = 1일째)
+        today = now.date()
+        joined_at = user.created_at.astimezone(KST).date()
+
+
         return MyProfileResponseDTO(
             id=user.id,
             email=user.email,
@@ -80,13 +108,17 @@ class MypageService:
             gender=user.gender,
             birth_date=user.birth_date,
             linked_doctors=linked_doctors,
-            setting=await self._get_setting_dto(user_id)
+            setting=await self._get_setting_dto(user_id),
+            age=calc_age(user.birth_date, today),
+            joined_at=joined_at,
+            days_since_join=(today - joined_at).days + 1
         )
 
 
     # 내 정보 수정 (닉네임, 이름, 생년월일, 성별)
     async def update_profile(self, user_id: int, dto: MyProfileUpdateDTO) -> MyProfileResponseDTO:
         # exclude_unset=True: 요청에 보내지 않은 컬럼은 제외
+        
         updated = await self.repo.update_user(user_id, dto.model_dump(exclude_unset=True))
         if not updated:
             raise HTTPException(
