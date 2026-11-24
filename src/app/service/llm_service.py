@@ -7,18 +7,22 @@ from app.repository.llm_repository import LlmRepository, get_llm_repository
 from app.model.chat_session_model import ChatSession
 from app.model.message_model import Message
 from app.model.session_checklist_model import SessionChecklist
+from app.model.session_summary_model import SessionSummary
+from app.model.emotion_analysis_model import EmotionAnalysis
 from app.enum.chat_enum import (
     InputType,
     MessageRole,
     ParseStatus,
     SessionEndReason,
     SessionStatus,
+    SummaryStatus,
     SystemRecordStatus,
 )
 from app.enum.checklist_enum import ChecklistStatus, SkipReason
 from app.schema.llm_schema import (
     KST,
     LlmReplyOutput,
+    LlmSummaryOutput,
     ScheduledSessionCreateDTO,
     ChatSessionResponseDTO,
     MainSessionResponseDTO,
@@ -41,13 +45,19 @@ ALLOWED_REQUIRED_SKIP_REASONS = {SkipReason.USER_DECLINED, SkipReason.NOT_APPLIC
 # 모든 LLM 시도가 실패했을 때 프론트에 내려줄 오류 문구 (messages에는 저장하지 않는다)
 FALLBACK_REPLY_TEXT = "llm답변 오류!"
 
+# 감정분석 6종 (emotion_analyses 컬럼명). 사후요약 LLM 입력에 메시지별로 붙인다.
+EMOTION_FIELDS = ("anger", "joy", "anxiety", "embarrassment", "sadness", "hurt")
+
 
 # 예외처리
 # 트랜잭션 관리 (commit / rollback은 이 service에서 정한다. repository는 flush까지만)
 #
 # 안전필터, 감정분석은 나중에 끼워 넣는다. (send_message 안의 표시된 위치)
-# 세션 요약, 타임아웃 배치는 repository 함수가 추가된 뒤에 구현한다. (파일 맨 아래 메모)
-# 사용자가 세션을 직접 종료하는 기능은 없다. (프론트에 종료 버튼 없음) 세션은 체크리스트 완료로만 종료된다.
+# 세션 사후요약은 6번(create_session_summary). 호출 위치는 아직 정하지 않았다.
+# 타임아웃 배치는 repository 함수가 추가된 뒤에 구현한다. (파일 맨 아래 메모)
+# 세션 종료 경로는 두 가지다.
+# - 체크리스트 완료: send_message의 종료 판정 (end_reason=COMPLETED)
+# - 중간 이탈: 프론트가 상담 화면을 떠날 때 end_session으로 통지 (end_reason=TIMEOUT, 임시). 종료 버튼은 없다.
 class LlmService:
 
     def __init__(self, repo: LlmRepository):
@@ -197,6 +207,42 @@ class LlmService:
 
             await self.repo.update_session(session, status=SessionStatus.ACTIVE, started_at=now)
             await self.repo.commit()
+        except Exception as error:
+            await self._rollback_and_raise(error)
+
+        return self._to_session_response(session)
+
+
+    # 3-1. 환자: 세션 이탈 종료 (프론트가 상담 화면을 떠날 때 통지)
+    # - 설계: AI 상담은 접속하면 끝날 때까지 진행한다. 중간에 나가면 그 세션은 종료된다.
+    # - ACTIVE -> ENDED, end_reason=TIMEOUT(임시), ended_at=now. summary_status는 PENDING 유지 (사후요약 대상)
+    # - 이미 ENDED면 바꾸지 않고 현재 상태를 돌려준다. (체크리스트 완료 후 나가는 경우, 통지가 두 번 오는 경우)
+    # - 그 밖의 상태(SCHEDULED 등)는 409
+    # - 진행 중인 send_message가 있으면, 그 턴의 트랜잭션 2가 재잠금에서 409가 되어 답변은 저장되지 않는다.
+    # TODO: end_reason을 TIMEOUT으로 임시 지정. 이탈 전용 사유가 필요하면 enum과 함께 정한다.
+    async def end_session(self, user_id: int, session_id: int) -> ChatSessionResponseDTO:
+        try:
+            session = await self.repo.find_session_by_id(session_id, user_id=user_id, for_update=True)
+            if session is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="세션이 존재하지 않습니다."
+                )
+
+            if session.status == SessionStatus.ACTIVE:
+                await self.repo.update_session(
+                    session,
+                    status=SessionStatus.ENDED,
+                    end_reason=SessionEndReason.TIMEOUT,
+                    ended_at=datetime.now(KST),
+                )
+            elif session.status != SessionStatus.ENDED:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="진행 중인 세션이 아닙니다."
+                )
+
+            await self.repo.commit() # 이미 ENDED면 변경 없이 잠금만 푼다.
         except Exception as error:
             await self._rollback_and_raise(error)
 
@@ -588,17 +634,163 @@ class LlmService:
         return session
 
 
+    # 6. 세션 사후요약 생성 (세션당 1건)
+    # - 대상: status=ENDED이고 summary_status=PENDING인 세션. 대상이 아니면 아무것도 하지 않고 None
+    # - 호출 위치(종료 직후 BackgroundTasks / 배치)는 아직 정하지 않았다. 어디서 부르든 이 함수 하나로 처리한다.
+    #   BackgroundTasks로 부를 경우 요청의 DB 세션이 닫힌 뒤이므로, 새 AsyncSession으로 만든 LlmService를 써야 한다.
+    # - session_summaries의 다섯 컬럼은 모두 LLM 출력(LlmSummaryOutput)을 그대로 텍스트로 넣는다.
+    #   mood_summary: 메시지별 감정분석 점수(float)를 LLM에 주고, 감정 흐름 분석을 텍스트로 받는다. (raw 수치는 저장하지 않는다)
+    #   감정분석이 한 건도 없으면(감정분석 모델 적용 전) mood_summary는 None
+    # - send_message처럼 LLM 호출을 잠금 밖에서 한다.
+    #   [트랜잭션 1: 세션 잠금 -> 대상 확인 -> 원문 + 감정분석 조회 -> commit]
+    #   [LLM 호출 / 검증 루프 (최대 MAX_LLM_ATTEMPTS회)]
+    #   [트랜잭션 2: 재잠금 -> 대상 재확인 -> 저장 + READY, 또는 FAILED -> commit]
+    # - 동시에 두 번 불리면 LLM은 두 번 호출될 수 있지만, 트랜잭션 2의 재확인 때문에 저장은 한 번만 된다.
+    # - 실패하면 summary_status=FAILED만 남기고 요약은 저장하지 않는다. (FAILED 재시도는 아직 없다)
+    # TODO: 요약 호출 기록(llm_calls, purpose=SUMMARY)은 남기지 않는다.
+    #       llm_calls.message_id가 NOT NULL이라 연결할 메시지가 없다. (테이블 수정 때 함께 정한다)
+    async def create_session_summary(self, session_id: int) -> SessionSummary | None:
+        # --- 트랜잭션 1: 잠금 -> 대상 확인 -> 원문 + 감정분석 조회 ---
+        try:
+            session = await self.repo.find_session_by_id(session_id, for_update=True)
+            if not self._is_summary_target(session):
+                await self.repo.commit() # 변경 없이 잠금만 푼다.
+                return None
+
+            rows = await self.repo.find_messages_with_emotions(session_id)
+            if not rows:
+                # 요약할 대화가 없다.
+                await self.repo.update_session(session, summary_status=SummaryStatus.SKIPPED)
+                await self.repo.commit()
+                return None
+
+            await self.repo.commit() # 잠금 해제. 이후 LLM 호출 동안 세션을 잠그지 않는다.
+        except Exception as error:
+            await self._rollback_and_raise(error)
+
+        summary_input = self._build_summary_input(rows)
+        has_emotion = any(item["emotion"] is not None for item in summary_input)
+
+        # --- LLM 호출 / 검증 루프 ---
+        output: LlmSummaryOutput | None = None
+        feedback: str | None = None
+
+        for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
+            parsed, _record = await self._call_summary_llm(summary_input, has_emotion, feedback, attempt)
+
+            if parsed is None:
+                errors = ["응답을 지정된 JSON 형식으로 해석하지 못했습니다."]
+            else:
+                errors = self._validate_summary_output(parsed, has_emotion)
+
+            if not errors:
+                output = parsed
+                break
+            feedback = self._build_retry_feedback(errors)
+
+        # --- 트랜잭션 2: 재잠금 -> 대상 재확인 -> 저장 또는 FAILED ---
+        try:
+            session = await self.repo.find_session_by_id(session_id, for_update=True)
+            if not self._is_summary_target(session):
+                # 그 사이 다른 호출이 먼저 처리했다.
+                await self.repo.commit()
+                return None
+
+            if output is None:
+                await self.repo.update_session(session, summary_status=SummaryStatus.FAILED)
+                await self.repo.commit()
+                return None
+
+            summary = await self.repo.upsert_session_summary(
+                session_id,
+                context_summary=output.context_summary,
+                mood_summary=output.mood_summary if has_emotion else None,
+                topics=output.topics,
+                chief_complaint=output.chief_complaint,
+                findings=output.findings,
+            )
+            await self.repo.update_session(session, summary_status=SummaryStatus.READY)
+            await self.repo.commit()
+            return summary
+        except Exception as error:
+            await self._rollback_and_raise(error)
+
+
+    # 6-1. 사후요약 내부: 요약 대상인지 (순수 함수)
+    @staticmethod
+    def _is_summary_target(session: ChatSession | None) -> bool:
+        return (
+            session is not None
+            and session.status == SessionStatus.ENDED
+            and session.summary_status == SummaryStatus.PENDING
+        )
+
+
+    # 6-2. 사후요약 내부: LLM 입력 만들기 (순수 함수)
+    # - 메시지마다 seq, role, content를 넣는다. role이 있어야 환자의 말과 AI의 답변을 구분할 수 있다.
+    # - emotion: 감정분석 6종 점수(Decimal -> float). 감정분석이 없는 메시지(AI 답변, 분석 전)는 None
+    @staticmethod
+    def _build_summary_input(
+        rows: list[tuple[Message, EmotionAnalysis | None]],
+    ) -> list[dict[str, Any]]:
+        summary_input: list[dict[str, Any]] = []
+        for message, emotion in rows:
+            summary_input.append({
+                "seq": message.seq,
+                "role": MessageRole(message.role).value,
+                "content": message.content,
+                "emotion": (
+                    {field: float(getattr(emotion, field)) for field in EMOTION_FIELDS}
+                    if emotion is not None else None
+                ),
+            })
+        return summary_input
+
+
+    # 6-3. 사후요약 내부: LLM 호출 1회 (재시도 루프는 create_session_summary가 돈다)
+    # - _call_llm과 같은 계약: 예외를 던지지 않고 (파싱된 출력 또는 None, 호출 기록)을 반환한다.
+    # - has_emotion이 False면 프롬프트에서 mood_summary를 null로 내라고 지시한다.
+    # - 호출 기록은 purpose=LlmPurpose.SUMMARY로 만들되, 지금은 저장하지 않는다. (create_session_summary의 TODO)
+    #
+    # TODO: 사후요약 전용 프롬프트와 LLM 클라이언트 미구현 (_call_llm과 같은 클라이언트를 쓸 예정)
+    # - 출력은 LlmSummaryOutput 스키마의 JSON으로 받는다.
+    # - 주호소(chief_complaint)와 AI 참고 소견(findings)은 이 프롬프트의 출력으로 요청한다.
+    async def _call_summary_llm(
+        self,
+        summary_input: list[dict[str, Any]],
+        has_emotion: bool,
+        feedback: str | None,
+        attempt: int,
+    ) -> tuple[LlmSummaryOutput | None, dict[str, Any]]:
+        raise NotImplementedError("사후요약 프롬프트와 LLM 클라이언트가 아직 구현되지 않았습니다.")
+
+
+    # 6-4. 사후요약 내부: LLM 출력 검증 (오류 목록 반환, 비어 있으면 통과)
+    # - 필수 텍스트가 비어 있지 않은지
+    # - 감정분석이 있는데 mood_summary가 없으면 재요청한다. (감정분석이 없을 때 온 mood_summary는 저장할 때 버린다)
+    @staticmethod
+    def _validate_summary_output(output: LlmSummaryOutput, has_emotion: bool) -> list[str]:
+        errors: list[str] = []
+
+        for field in ("context_summary", "topics", "chief_complaint", "findings"):
+            if not getattr(output, field).strip():
+                errors.append(f"{field}가 비어 있습니다.")
+
+        if has_emotion and not (output.mood_summary and output.mood_summary.strip()):
+            errors.append("감정분석 데이터가 있으므로 mood_summary가 필요합니다.")
+
+        return errors
+
+
     # 보류 (repository 함수가 추가된 뒤에 구현)
-    # - create_session_summary(session_id): upsert_session_summary 필요
     # - process_session_timeouts(now): expire_scheduled_sessions, end_stale_active_sessions 필요
     #
-    # 추후 추가 (방치 세션 처리)
+    # 방치 세션 처리
+    # - 설계: AI 상담은 접속하면 끝날 때까지 진행하고, 중간에 나가면 세션을 종료한다. (end_session)
     # - expires_at(필수)은 최초 접속(start_session) 때 한 번만 검증한다. 시작한 뒤에는 expires_at을 다시 검증하지 않는다.
     # - 세션 상태(status)는 외부 표시용이다. 접속 가능 여부의 검증 기준으로 쓰지 않는다.
-    # - 시작해 놓고 계속 열어 둔 채 방치된 ACTIVE 세션을 검증하고 정리하는 로직은 아직 없다.
-    #   (마지막 활동 시각 기준, 정리 시 상태와 end_reason 처리, 요약 상태 처리 등을 정해서 추가할 예정)
-    # - 사용자가 직접 종료할 수 없으므로, 방치된 ACTIVE 세션은 다음 세션 시작(start_session)을 409로 막는다.
-    #   이 정리 로직이 없으면 체크리스트를 끝내지 못한 환자는 다음 세션에 들어갈 수 없다.
+    # - 이탈 통지가 오지 않는 경우(앱 강제 종료, 네트워크 끊김)는 아직 처리하지 않는다.
+    #   그런 ACTIVE 세션은 다음 세션 시작(start_session)을 409로 막으므로, 서버 쪽 정리(process_session_timeouts)가 여전히 필요하다.
 
 
 

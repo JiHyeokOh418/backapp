@@ -14,6 +14,7 @@ from app.model.checklist_event_model import ChecklistEvent
 from app.model.llm_call_model import LlmCall
 from app.model.session_summary_model import SessionSummary
 from app.model.care_relation_model import CareRelation
+from app.model.emotion_analysis_model import EmotionAnalysis
 from app.enum.chat_enum import SessionStatus, MessageRole
 from app.enum.checklist_enum import ChecklistStatus, SkipReason
 from sqlalchemy import select, update, func, exists
@@ -410,6 +411,47 @@ class LlmRepository:
         )
         result = await self.db.execute(query)
         return result.scalar_one_or_none() is not None
+
+
+    # 세션 사후요약
+    # 22. 사후요약 입력용: 세션 원문 전체(seq 순) + 메시지별 감정분석
+    # - 감정분석은 사용자 메시지 1건당 1건이라는 전제로 LEFT JOIN한다. (AI 답변, 분석 전 메시지는 None)
+    # - 1건이 넘게 붙으면 메시지가 중복되어 나오므로, 그 전제가 바뀌면 이 쿼리도 바꿔야 한다.
+    async def find_messages_with_emotions(
+        self, session_id: int
+    ) -> list[tuple[Message, EmotionAnalysis | None]]:
+        query = (
+            select(Message, EmotionAnalysis)
+            .outerjoin(EmotionAnalysis, EmotionAnalysis.message_id == Message.id)
+            .where(Message.session_id == session_id)
+            .order_by(Message.seq.asc())
+        )
+        result = await self.db.execute(query)
+        return [(message, emotion) for message, emotion in result.all()]
+
+
+    # 23. 사후요약 저장 (세션당 1건. 있으면 덮어쓰고, 없으면 새로 만든다)
+    # - service가 세션 행을 잠근 상태에서 부르므로, 같은 세션의 요약을 동시에 두 번 만들지 않는다.
+    # - fields는 session_summaries 컬럼명 그대로 (context_summary, mood_summary, topics, chief_complaint, findings)
+    async def upsert_session_summary(self, session_id: int, **fields: Any) -> SessionSummary:
+        for key in fields:
+            if not hasattr(SessionSummary, key):
+                raise AttributeError(f"session_summaries에 없는 컬럼: {key}")
+
+        result = await self.db.execute(
+            select(SessionSummary).where(SessionSummary.session_id == session_id)
+        )
+        summary = result.scalar_one_or_none()
+
+        if summary is None:
+            summary = SessionSummary(session_id=session_id, **fields)
+            self.db.add(summary)
+        else:
+            for key, value in fields.items():
+                setattr(summary, key, value)
+
+        await self.db.flush()
+        return summary
 
 
 

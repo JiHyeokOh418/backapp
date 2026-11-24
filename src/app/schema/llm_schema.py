@@ -44,6 +44,21 @@ class LlmReplyOutput(BaseModel):
     end_reason: Literal["completed", "safety"] | None = Field(description="종료 요청일 때만 사유, 아니면 null")
 
 
+# 세션 사후요약 LLM 출력 (session_summaries 1건)
+# - session_summaries의 id, session_id, created_at을 뺀 컬럼은 모두 text로 바뀔 예정이라, 전부 문자열로 받는다.
+#   (지금 mood_summary, topics, findings 컬럼은 JSONB라 문자열이 JSON 문자열로 저장된다. 테이블 수정 후 그대로 text가 된다)
+# - mood_summary: 메시지별 감정분석 점수를 보고 세션 전체의 감정 흐름을 서술한다.
+#   감정분석 데이터가 하나도 없으면 null (service가 한 번 더 강제한다)
+class LlmSummaryOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    context_summary: str = Field(description="다음 세션에 넘길 상담 맥락 요약")
+    mood_summary: str | None = Field(description="세션 전체의 감정 흐름 분석. 감정분석 데이터가 없으면 null")
+    topics: str = Field(description="이번 세션에서 다룬 주제")
+    chief_complaint: str = Field(description="주호소: 환자가 가장 주로 호소한 문제")
+    findings: str = Field(description="AI 참고 소견 (의사 참고용, 진단이 아님)")
+
+
 # ============================================================
 # 2. 프론트 응답 DTO
 # - LLM 출력 모델과 분리한다. 내부 값(체크리스트 값, evidence_seq 등)은 내려보내지 않는다.

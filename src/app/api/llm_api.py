@@ -16,7 +16,7 @@ from app.dependencie.auth_dependency import get_current_user, get_current_doctor
 # AI 상담(LLM) API
 # - router: 환자용. main.py에서 prefix="/chat"으로 등록한다. (인증: get_current_user)
 # - doctor_router: 의사용. main.py에서 prefix="/doctor"로 등록한다. (인증: get_current_doctor)
-# - 사용자가 세션을 직접 종료하는 API는 없다. (프론트에 종료 버튼 없음)
+# - 종료 버튼은 없다. 프론트는 상담 화면을 떠날 때 POST /chat/sessions/{session_id}/end로 이탈을 통지한다.
 router = APIRouter()
 doctor_router = APIRouter()
 
@@ -78,6 +78,29 @@ async def start_session(
     return ApiResponseDTO(
         success=True,
         message="상담 세션 시작",
+        data=session
+    )
+
+
+# 2-1. 세션 이탈 종료 (프론트가 상담 화면을 떠날 때 통지. ACTIVE -> ENDED, end_reason=timeout)
+# - 이미 종료된 세션이면 바꾸지 않고 현재 상태를 돌려준다. (두 번 보내도 안전)
+# - 본문이 없으므로 페이지를 닫을 때 navigator.sendBeacon이나 fetch(keepalive: true)로 보낼 수 있다.
+@router.post(
+    "/sessions/{session_id}/end",
+    summary="상담 세션 이탈 종료",
+    response_model=ApiResponseDTO[ChatSessionResponseDTO],
+    responses={404: SESSION_NOT_FOUND, 409: NOT_ACTIVE}
+)
+async def end_session(
+    session_id: int,
+    current_user: UserClaimDTO = Depends(get_current_user),
+    llm_service: LlmService = Depends(get_llm_service)
+):
+    session = await llm_service.end_session(current_user.id, session_id)
+
+    return ApiResponseDTO(
+        success=True,
+        message="상담 세션 종료",
         data=session
     )
 
