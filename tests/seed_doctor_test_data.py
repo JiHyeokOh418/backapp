@@ -5,7 +5,7 @@
     python ../tests/seed_doctor_test_data.py          # 지우고 다시 넣기
     python ../tests/seed_doctor_test_data.py --reset  # 지우기만
 
-- 테스트 데이터 표시: 이메일 '@test.mindbridge', 병원 이름 '[TEST]', 문항 item_key 'test_'
+- 테스트 데이터 표시: 이메일 '@test.mindbridge', 병원·일일목표 이름 '[TEST]', 문항 item_key 'test_'
 - 지우기: 위 표시가 붙은 사용자·병원·문항만 지운다. 나머지는 FK의 ON DELETE CASCADE로 같이 지워진다.
 - 시각은 실행한 날(KST) 기준으로 만든다. (오늘 예약, 최근 2주 감정 기록 등)
 - 끝나면 Swagger에서 쓸 access_token 쿠키 값을 출력한다.
@@ -40,6 +40,9 @@ from app.models.assessment_result_model import AssessmentResult  # noqa: E402
 from app.models.emotion_record_model import EmotionRecord  # noqa: E402
 from app.models.doctor_memo_model import DoctorMemo  # noqa: E402
 from app.models.schedule_model import Schedule  # noqa: E402
+from app.models.mission_model import Mission  # noqa: E402
+from app.models.user_mission_log_model import UserMissionLog  # noqa: E402
+from app.models.diary_model import Diary  # noqa: E402
 from app.schema.user_schema import UserClaimDTO  # noqa: E402
 from app.util.jwt_token_util import generate_access_token  # noqa: E402
 
@@ -65,6 +68,7 @@ async def reset(db) -> None:
     await db.execute(delete(Room).where(Room.hospital_id.in_(test_hospitals)))
     await db.execute(delete(Hospital).where(Hospital.hospital_id.in_(test_hospitals)))
     await db.execute(delete(ChecklistItem).where(ChecklistItem.item_key.like(f"{ITEM_PREFIX}%")))
+    await db.execute(delete(Mission).where(Mission.name.like(f"{HOSPITAL_PREFIX}%")))  # 수행 기록은 사용자와 함께 지워짐
     await db.commit()
 
 
@@ -296,6 +300,51 @@ async def seed(db) -> dict[str, User]:
                    created_at=now - timedelta(days=5), updated_at=now - timedelta(days=5)),
         DoctorMemo(patient_id=p1.id, doctor_id=a.id, category="counsel", content="친구와의 관계가 지지 요인",
                    created_at=now - timedelta(days=2), updated_at=now - timedelta(days=2)),
+    ])
+
+    # ===== 환자 캘린더 (김민준) =====
+    goals = [
+        Mission(name=f"{HOSPITAL_PREFIX} 마음이와 대화하기", mission_type="daily_goal", category="mind", reward_point=15, sort_order=1),
+        Mission(name=f"{HOSPITAL_PREFIX} 마음 기록", mission_type="daily_goal", category="mind", reward_point=10, sort_order=2),
+        Mission(name=f"{HOSPITAL_PREFIX} 한 줄 일기 쓰기", mission_type="daily_goal", category="mind", reward_point=10, sort_order=3,
+                description="한 줄만 써도 충분해요"),
+        Mission(name=f"{HOSPITAL_PREFIX} 산책 10분", mission_type="daily_goal", category="body", reward_point=5, sort_order=4,
+                description="햇볕 쬐며 가볍게 걷기"),
+        Mission(name=f"{HOSPITAL_PREFIX} 약 챙겨 먹기", mission_type="daily_goal", category="habit", reward_point=5, sort_order=5),
+        Mission(name=f"{HOSPITAL_PREFIX} 물 6잔 마시기", mission_type="daily_goal", category="habit", reward_point=5, sort_order=6,
+                target_count=6),
+        Mission(name=f"{HOSPITAL_PREFIX} 모두 완료 보너스", mission_type="all_clear_bonus", reward_point=10, sort_order=99),  # 목록 제외
+        Mission(name=f"{HOSPITAL_PREFIX} 사용 중지 목표", mission_type="daily_goal", reward_point=5, sort_order=7, is_active=False),  # 목록 제외
+    ]
+    db.add_all(goals)
+    await db.flush()
+    walk, water, diary_goal, pill = goals[3], goals[5], goals[2], goals[4]
+    yesterday = today - timedelta(days=1)
+    db.add_all([
+        # 오늘: 산책 완료, 물 6잔 완료 (나머지 목표는 기록 없음 = 진행 0)
+        UserMissionLog(user_id=p1.id, mission_id=walk.mission_id, log_date=today, progress_count=1, completed_at=at(today, 8)),
+        UserMissionLog(user_id=p1.id, mission_id=water.mission_id, log_date=today, progress_count=6, completed_at=at(today, 9)),
+        # 어제: 약 완료, 산책은 완료 후 취소, 물은 3잔 진행 중
+        UserMissionLog(user_id=p1.id, mission_id=pill.mission_id, log_date=yesterday, progress_count=1, completed_at=at(yesterday, 9)),
+        UserMissionLog(user_id=p1.id, mission_id=walk.mission_id, log_date=yesterday, progress_count=1,
+                       completed_at=at(yesterday, 10), canceled_at=at(yesterday, 11)),
+        UserMissionLog(user_id=p1.id, mission_id=water.mission_id, log_date=yesterday, progress_count=3),
+        # 다른 환자: 오늘 일기 목표 완료 -> 김민준 캘린더에 안 나와야 함
+        UserMissionLog(user_id=p2.id, mission_id=diary_goal.mission_id, log_date=today, progress_count=1, completed_at=at(today, 8)),
+    ])
+    db.add_all([
+        Diary(user_id=p1.id, diary_date=at(today, 0), content="오늘은 산책을 했다. 햇볕이 따뜻해서 기분이 조금 나아졌다." * 2),
+        Diary(user_id=p1.id, diary_date=at(today - timedelta(days=2), 0), content="지운 일기", deleted_at=now),  # 안 나와야 함
+        Diary(user_id=p1.id, diary_date=at(today - timedelta(days=3), 0), content="잠을 잘 못 잤다."),
+    ])
+    db.add_all([
+        Schedule(user_id=p1.id, created_by=a.id, schedule_type="exam", title="심리검사", start_at=at(tomorrow, 14),
+                 end_at=at(tomorrow, 15), created_at=now),
+        Schedule(user_id=p1.id, created_by=a.id, schedule_type="notice", title="병원 휴진 안내", start_at=at(today, 9), created_at=now),
+        Schedule(user_id=p1.id, created_by=p1.id, schedule_type="personal", title="친구 만나기", start_at=at(today, 19),
+                 memo="카페", remind_at=at(today, 18), created_at=now),
+        Schedule(user_id=p2.id, created_by=p2.id, schedule_type="personal", title="다른 환자 일정", start_at=at(today, 10),
+                 created_at=now),
     ])
 
     await db.commit()

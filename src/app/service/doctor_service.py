@@ -1,4 +1,3 @@
-import calendar
 from collections import Counter
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal
@@ -51,6 +50,7 @@ from app.schema.doctor_schema import (
     AppointmentStatusUpdateDTO,
 )
 from app.schema.common_schema import PageResponseDTO
+from app.util.date_util import kst_day_range, today_kst, add_months
 from app.models.chat_session_model import ChatSession
 
 KST = timezone(timedelta(hours=9)) # UTC+9
@@ -60,23 +60,6 @@ RISK_RANK = {RiskEventLevel.HIGH: 3, RiskEventLevel.MEDIUM: 2, RiskEventLevel.LO
 
 # 환자 목록 탭 -> 그날 예약 상태
 TAB_STATUS = {"waiting": AppointmentStatus.WAITING, "booked": AppointmentStatus.BOOKED}
-
-
-# KST 기준 하루 [시작, 다음날 시작)
-def kst_day_range(day: date) -> tuple[datetime, datetime]:
-    start = datetime.combine(day, time.min, tzinfo=KST)
-    return start, start + timedelta(days=1)
-
-
-# date 파라미터가 없으면 오늘(KST)
-def today_kst() -> date:
-    return datetime.now(KST).date()
-
-
-# day에서 months개월 뒤(음수면 앞) 같은 날 (그 달에 없는 날이면 말일로: 5/31 - 3개월 -> 2/28)
-def add_months(day: date, months: int) -> date:
-    year, month_index = divmod(day.year * 12 + day.month - 1 + months, 12)
-    return date(year, month_index + 1, min(day.day, calendar.monthrange(year, month_index + 1)[1]))
 
 
 # 오늘(KST)에서 months개월 전 같은 날 0시
