@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 from fastapi import Response, Request, HTTPException, status, Depends
 
 from app.schema.user_schema import UserClaimDTO
-from app.enum.user_enum import UserRole
+from app.enums.user_enum import UserRole
 from app.schema.auth_schema import JwtTokenDTO
 from app.util.jwt_token_util import parse_token
 from app.service.auth_service import AuthService, get_auth_service

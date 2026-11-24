@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from pydantic import Field, field_validator, field_serializer
-from app.enum.hospital_enum import MemoCategory
+from app.enums.doctor_memo_enum import DoctorMemoCategory
 from app.schema.common_schema import BaseDTO
 
 KST = timezone(timedelta(hours=9)) # UTC+9
@@ -8,7 +8,7 @@ KST = timezone(timedelta(hours=9)) # UTC+9
 
 # 메모 작성 요청
 class MemoCreateDTO(BaseDTO):
-    category: MemoCategory
+    category: DoctorMemoCategory
     content: str = Field(max_length=1000)
     is_pinned: bool = False
 
@@ -25,7 +25,7 @@ class MemoCreateDTO(BaseDTO):
 # 메모 수정·고정 요청 (보낸 값만 수정: model_dump(exclude_unset=True))
 # - 고정만 바꿀 때는 {"isPinned": true} 만 보내면 된다.
 class MemoUpdateDTO(BaseDTO):
-    category: MemoCategory | None = None
+    category: DoctorMemoCategory | None = None
     content: str | None = Field(default=None, max_length=1000)
     is_pinned: bool | None = None
 
@@ -46,7 +46,7 @@ class MemoResponseDTO(BaseDTO):
     patient_id: int
     doctor_id: int
     doctor_name: str | None = None  # 작성자 이름 (예: 이은솔)
-    category: MemoCategory
+    category: DoctorMemoCategory
     content: str
     is_pinned: bool
     is_edited: bool                 # 내용을 고친 적이 있으면 true -> "수정됨" 표시
