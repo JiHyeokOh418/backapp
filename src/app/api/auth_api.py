@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, Response, Request, HTTPException, status
 from app.schema.common_schema import ApiResponseDTO
 from app.schema.user_schema import UserClaimDTO
-from app.enum.user_enum import SocialProvider
+from app.enums.user_enum import UserSocialProvider
 from app.schema.auth_schema import JwtTokenDTO, SocialLoginRequestDTO
 from app.service.auth_service import AuthService, get_auth_service
 from app.dependencie.auth_dependency import get_current_user, get_tokens
@@ -77,7 +77,7 @@ async def google_login_callback(
     user = user_res.json()
     user_params = {
         "email": user.get("email"),
-        "social_provider": SocialProvider.GOOGLE.value,
+        "social_provider": UserSocialProvider.GOOGLE.value,
         "social_id": user.get("sub")
     }
 
@@ -136,7 +136,7 @@ async def kakao_login_callback(
     user = user_res.json()
     user_params = {
         "email": (user.get("kakao_account") or {}).get("email"),
-        "social_provider": SocialProvider.KAKAO.value,
+        "social_provider": UserSocialProvider.KAKAO.value,
         "social_id": str(user.get("id"))
     }
 
@@ -196,7 +196,7 @@ async def naver_login_callback(
     user = user_res.json().get("response") or {}
     user_params = {
         "email": user.get("email"),
-        "social_provider": SocialProvider.NAVER.value,
+        "social_provider": UserSocialProvider.NAVER.value,
         "social_id": str(user.get("id"))
     }
 

@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query, status
 from app.service.doctor_verification_service import (
     get_doctor_verification_service, DoctorVerificationService
 )
-from app.enum.user_enum import VerificationStatus
+from app.enums.doctor_verification_enum import DoctorVerificationStatus
 from app.schema.user_schema import UserClaimDTO
 from app.schema.doctor_verification_schema import (
     HospitalResponseDTO,
@@ -111,8 +111,8 @@ async def get_my_verification(
     responses={403: NOT_ADMIN}
 )
 async def get_verifications(
-    verification_status: VerificationStatus | None = Query(
-        default=VerificationStatus.PENDING, alias="status", description="없으면 pending"
+    verification_status: DoctorVerificationStatus | None = Query(
+        default=DoctorVerificationStatus.PENDING, alias="status", description="없으면 pending"
     ),
     current_user: UserClaimDTO = Depends(get_current_user),
     service: DoctorVerificationService = Depends(get_doctor_verification_service)

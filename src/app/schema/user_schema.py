@@ -1,6 +1,6 @@
 from datetime import date, datetime
 from pydantic import BaseModel
-from app.enum.user_enum import UserRole, SocialProvider, Gender
+from app.enums.user_enum import UserRole, UserSocialProvider, UserGender
 from app.schema.common_schema import BaseDTO
 
 
@@ -10,13 +10,13 @@ class UserClaimDTO(BaseModel):
     id: int
     email: str
     role: UserRole
-    social_provider: SocialProvider
+    social_provider: UserSocialProvider
 
 
 # 소셜 회원가입 (role은 기본값 PATIENT)
 class UserCreateDTO(BaseModel):
     email: str
-    social_provider: SocialProvider
+    social_provider: UserSocialProvider
     social_id: str
 
 
@@ -26,9 +26,9 @@ class UserResponseDTO(BaseDTO):
     email: str
     nickname: str | None = None
     role: UserRole
-    social_provider: SocialProvider
+    social_provider: UserSocialProvider
     name: str | None = None
-    gender: Gender | None = None
+    gender: UserGender | None = None
     birth_date: date | None = None
     doctor_id: int | None = None
     point_balance: int
@@ -39,5 +39,5 @@ class UserResponseDTO(BaseDTO):
 class UserUpdateDTO(BaseDTO):
     nickname: str | None = None
     name: str | None = None
-    gender: Gender | None = None
+    gender: UserGender | None = None
     birth_date: date | None = None
