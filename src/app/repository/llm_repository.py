@@ -13,6 +13,7 @@ from app.model.session_checklist_model import SessionChecklist
 from app.model.checklist_event_model import ChecklistEvent
 from app.model.llm_call_model import LlmCall
 from app.model.session_summary_model import SessionSummary
+from app.model.care_relation_model import CareRelation
 from app.enum.chat_enum import SessionStatus, MessageRole
 from app.enum.checklist_enum import ChecklistStatus, SkipReason
 from sqlalchemy import select, update, func, exists
@@ -64,7 +65,9 @@ class LlmRepository:
         if user_id is not None:
             query = query.where(ChatSession.user_id == user_id)
         if for_update:
-            query = query.with_for_update()
+            # populate_existing: 같은 AsyncSession에서 이미 읽은 객체여도 DB의 최신 값으로 덮어쓴다.
+            # (send_message는 트랜잭션 1, 2에서 같은 세션을 다시 잠그는데, 그 사이 다른 요청이 상태를 바꿀 수 있다)
+            query = query.with_for_update().execution_options(populate_existing=True)
 
         result = await self.db.execute(query)
         return result.scalar_one_or_none()
@@ -108,6 +111,24 @@ class LlmRepository:
             exists().where(
                 ChatSession.user_id == user_id,
                 ChatSession.status == SessionStatus.ACTIVE
+            )
+        )
+        result = await self.db.execute(query)
+        return bool(result.scalar())
+
+
+    # 4-1. 접속 기간(scheduled_at ~ expires_at)이 겹치는 세션이 있는지 (세션 등록 전 확인)
+    # - 겹침 조건: 기존.scheduled_at < 새.expires_at AND 기존.expires_at > 새.scheduled_at
+    # - 취소(CANCELLED)된 세션은 제외. 시각이 비어 있는 세션은 비교 결과가 NULL이라 자동으로 빠진다.
+    async def exists_overlapping_session(
+        self, user_id: int, scheduled_at: datetime, expires_at: datetime
+    ) -> bool:
+        query = select(
+            exists().where(
+                ChatSession.user_id == user_id,
+                ChatSession.status != SessionStatus.CANCELLED,
+                ChatSession.scheduled_at < expires_at,
+                ChatSession.expires_at > scheduled_at
             )
         )
         result = await self.db.execute(query)
@@ -163,10 +184,20 @@ class LlmRepository:
         return result.scalar_one_or_none()
 
 
-    # 8. 사용자 메시지에 대한 AI 답변 (재전송 시 이미 만든 답을 돌려주기 위함)
-    # TODO: messages.reply_to_id 컬럼을 추가해야 동작한다. 추가 전에 호출하면 AttributeError
-    async def find_reply(self, user_message_id: int) -> Message | None:
-        query = select(Message).where(Message.reply_to_id == user_message_id)
+    # 8. 재전송 시 이미 만든 AI 답변
+    # - after_seq(재전송된 사용자 메시지의 seq) 뒤에 있는 가장 최근 ASSISTANT 메시지
+    # - after_seq 조건이 없으면, 첫 요청이 아직 처리 중일 때 이전 턴의 답변을 잘못 돌려주게 된다.
+    async def find_reply(self, session_id: int, after_seq: int) -> Message | None:
+        query = (
+            select(Message)
+            .where(
+                Message.session_id == session_id,
+                Message.role == MessageRole.ASSISTANT,
+                Message.seq > after_seq
+            )
+            .order_by(Message.seq.desc())
+            .limit(1)
+        )
         result = await self.db.execute(query)
         return result.scalar_one_or_none()
 
@@ -363,7 +394,24 @@ class LlmRepository:
         result = await self.db.execute(query)
         return result.scalar_one_or_none()
 
-    
+
+    # 담당 관계
+    # 21. 의사가 해당 환자의 담당인지 (세션 등록 때 1회 확인)
+    # - memo_repository.exists_care_relation과 같은 쿼리 (종료되지 않은 관계만)
+    async def exists_care_relation(self, doctor_id: int, patient_id: int) -> bool:
+        query = (
+            select(CareRelation.relation_id)
+            .where(
+                CareRelation.doctor_id == doctor_id,
+                CareRelation.patient_id == patient_id,
+                CareRelation.ended_at.is_(None)
+            )
+            .limit(1)
+        )
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none() is not None
+
+
 
 # 주입 팩토리 메서드
 def get_llm_repository(db: AsyncSession = Depends(get_postgresql_db)):

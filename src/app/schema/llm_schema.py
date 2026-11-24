@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
-from app.enum.chat_enum import SessionStatus, SessionType, MessageRole, InputType
+from app.enum.chat_enum import SessionStatus, SessionType, MessageRole, InputType, Expression
 from app.enum.checklist_enum import SkipReason
 from app.schema.common_schema import BaseDTO
 
@@ -37,7 +37,7 @@ class LlmReplyOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reply_text: str = Field(description="사용자에게 보여줄 답변")
-    expression: str | None = Field(description="캐릭터 표정")
+    expression: Expression = Field(description="캐릭터 표정. 특별한 감정이 없으면 default")
     checklist_changes: list[ChecklistChangeOutput] = Field(description="이번 턴에 상태가 바뀐 항목. 없으면 빈 배열")
     asked_item_ids: list[int] = Field(description="이번 답변에서 질문한 체크리스트 항목 id. 없으면 빈 배열")
     counsel_end: bool = Field(description="체크리스트를 모두 채웠다고 판단하면 true. 최종 판단은 서버가 DB로 확인한다")
@@ -77,7 +77,7 @@ class MessageResponseDTO(BaseDTO):
     seq: int
     role: MessageRole
     content: str
-    expression: str | None = None
+    expression: Expression | None = None # 사용자 메시지는 None
     created_at: datetime
 
     @field_serializer("created_at")

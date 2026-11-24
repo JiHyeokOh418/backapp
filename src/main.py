@@ -6,7 +6,7 @@ from app.infrastructure.postgresql import engine, Base
 from app.infrastructure.redis import start_redis_client
 from app.infrastructure.s3 import start_s3_client
 import app.models
-from app.api import default_api, auth_api, user_api, memo_api, doctor_verification_api
+from app.api import default_api, auth_api, user_api, memo_api, doctor_verification_api, llm_api
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,3 +46,5 @@ app.include_router(user_api.router, prefix="/users", tags=["users"])
 app.include_router(memo_api.router, prefix="/doctor", tags=["memo"])
 app.include_router(doctor_verification_api.router, prefix="/doctor", tags=["doctor-verification"])
 app.include_router(doctor_verification_api.admin_router, prefix="/admin", tags=["admin"])
+app.include_router(llm_api.router, prefix="/chat", tags=["chat"])
+app.include_router(llm_api.doctor_router, prefix="/doctor", tags=["doctor-chat"])
