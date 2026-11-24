@@ -5,7 +5,7 @@ from fastapi import Depends
 from app.infrastructure.postgresql import get_postgresql_db
 
 # 모델, ORM
-from app.model.diary_model import Diary
+from app.models.diary_model import Diary
 
 
 # 마음 일기 DB 접근 (조회/저장만 담당, 비즈니스 규칙은 service에서 처리)

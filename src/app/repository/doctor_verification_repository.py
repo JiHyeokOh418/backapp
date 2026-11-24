@@ -6,12 +6,13 @@ from app.infrastructure.postgresql import get_postgresql_db
 from fastapi import Depends
 
 # 모델, ORM
-from app.model.user_model import User
-from app.model.admin_model import Admin
-from app.model.hospital_model import Hospital
-from app.model.doctor_profile_model import DoctorProfile
-from app.model.doctor_verification_model import DoctorVerification
-from app.enum.user_enum import UserRole, VerificationStatus
+from app.models.user_model import User
+from app.models.admin_model import Admin
+from app.models.hospital_model import Hospital
+from app.models.doctor_profile_model import DoctorProfile
+from app.models.doctor_verification_model import DoctorVerification
+from app.enums.user_enum import UserRole
+from app.enums.doctor_verification_enum import DoctorVerificationStatus
 from sqlalchemy import insert, select, update, exists
 
 KST = timezone(timedelta(hours=9)) # UTC+9
@@ -48,7 +49,7 @@ class DoctorVerificationRepository:
     async def exists_pending(self, user_id: int) -> bool:
         query = select(exists().where(
             DoctorVerification.user_id == user_id,
-            DoctorVerification.status == VerificationStatus.PENDING
+            DoctorVerification.status == DoctorVerificationStatus.PENDING
         ))
         result = await self.db.execute(query)
         return result.scalar()
@@ -96,7 +97,7 @@ class DoctorVerificationRepository:
 
 
     # 7. 신청 목록 (관리자) - 상태 필터, 오래된 신청부터
-    async def find_verifications(self, status: VerificationStatus | None) -> list[DoctorVerification]:
+    async def find_verifications(self, status: DoctorVerificationStatus | None) -> list[DoctorVerification]:
         query = (
             select(DoctorVerification)
             .options(selectinload(DoctorVerification.user), selectinload(DoctorVerification.hospital))
@@ -126,9 +127,9 @@ class DoctorVerificationRepository:
             update(DoctorVerification)
             .where(
                 DoctorVerification.id == verification_id,
-                DoctorVerification.status == VerificationStatus.PENDING
+                DoctorVerification.status == DoctorVerificationStatus.PENDING
             )
-            .values(status=VerificationStatus.APPROVED, reviewed_by=admin_id, reviewed_at=now)
+            .values(status=DoctorVerificationStatus.APPROVED, reviewed_by=admin_id, reviewed_at=now)
             .returning(DoctorVerification.user_id, DoctorVerification.hospital_id, DoctorVerification.specialty)
         )
 
@@ -163,10 +164,10 @@ class DoctorVerificationRepository:
             update(DoctorVerification)
             .where(
                 DoctorVerification.id == verification_id,
-                DoctorVerification.status == VerificationStatus.PENDING
+                DoctorVerification.status == DoctorVerificationStatus.PENDING
             )
             .values(
-                status=VerificationStatus.REJECTED,
+                status=DoctorVerificationStatus.REJECTED,
                 reject_reason=reject_reason,
                 reviewed_by=admin_id,
                 reviewed_at=datetime.now(KST)

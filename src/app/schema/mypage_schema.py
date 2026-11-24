@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from app.enum.user_enum import Gender
+from app.enums.user_enum import UserGender
 from app.schema.common_schema import BaseDTO
 
 
@@ -32,7 +32,7 @@ class MyProfileResponseDTO(BaseDTO):
     email: str
     nickname: str | None = None
     name: str | None = None
-    gender: Gender | None = None
+    gender: UserGender | None = None
     birth_date: date | None = None
     linked_doctors: list[LinkedDoctorResponseDTO] = []
     setting: UserSettingResponseDTO
@@ -56,5 +56,5 @@ class MypageSummaryResponseDTO(BaseDTO):
 class MyProfileUpdateDTO(BaseDTO):
     nickname: str | None = None
     name: str | None = None
-    gender: Gender | None = None
+    gender: UserGender | None = None
     birth_date: date | None = None

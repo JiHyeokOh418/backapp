@@ -1,6 +1,6 @@
 from datetime import datetime
 from pydantic import Field
-from app.enum.user_enum import VerificationStatus
+from app.enums.doctor_verification_enum import DoctorVerificationStatus
 from app.schema.common_schema import BaseDTO
 
 
@@ -38,7 +38,7 @@ class DoctorVerificationResponseDTO(BaseDTO):
     license_number: str
     specialty: str | None = None
     license_file_url: str | None = None
-    status: VerificationStatus
+    status: DoctorVerificationStatus
     reject_reason: str | None = None
     reviewed_at: datetime | None = None
     created_at: datetime

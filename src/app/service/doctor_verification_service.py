@@ -3,8 +3,9 @@ from sqlalchemy.exc import IntegrityError
 from app.repository.doctor_verification_repository import (
     DoctorVerificationRepository, get_doctor_verification_repository
 )
-from app.model.doctor_verification_model import DoctorVerification
-from app.enum.user_enum import UserRole, VerificationStatus
+from app.models.doctor_verification_model import DoctorVerification
+from app.enums.user_enum import UserRole
+from app.enums.doctor_verification_enum import DoctorVerificationStatus
 from app.schema.user_schema import UserClaimDTO
 from app.schema.doctor_verification_schema import (
     HospitalResponseDTO,
@@ -103,13 +104,13 @@ class DoctorVerificationService:
         return MyVerificationResponseDTO(
             verification=self._to_response(latest),
             relogin_required=(
-                latest.status == VerificationStatus.APPROVED and current_user.role != UserRole.DOCTOR
+                latest.status == DoctorVerificationStatus.APPROVED and current_user.role != UserRole.DOCTOR
             )
         )
 
 
     # 4. 신청 목록 (관리자)
-    async def get_verifications(self, user_id: int, verification_status: VerificationStatus | None) -> list[DoctorVerificationResponseDTO]:
+    async def get_verifications(self, user_id: int, verification_status: DoctorVerificationStatus | None) -> list[DoctorVerificationResponseDTO]:
         await self._get_admin_id(user_id)
         verifications = await self.repo.find_verifications(verification_status)
         return [self._to_response(verification) for verification in verifications]

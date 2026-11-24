@@ -5,9 +5,9 @@ from app.infrastructure.postgresql import get_postgresql_db
 from fastapi import Depends
 
 # 모델, ORM
-from app.model.user_model import User
-from app.model.care_relation_model import CareRelation
-from app.model.doctor_memo_model import DoctorMemo
+from app.models.user_model import User
+from app.models.care_relation_model import CareRelation
+from app.models.doctor_memo_model import DoctorMemo
 from sqlalchemy import insert, select, update, func
 
 KST = timezone(timedelta(hours=9)) # UTC+9

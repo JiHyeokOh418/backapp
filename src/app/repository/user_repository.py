@@ -4,8 +4,8 @@ from app.infrastructure.postgresql import get_postgresql_db
 from fastapi import Depends
 
 # 모델, ORM
-from app.model.user_model import User
-from app.enum.user_enum import SocialProvider
+from app.models.user_model import User
+from app.enums.user_enum import UserSocialProvider
 from app.schema.user_schema import UserCreateDTO, UserClaimDTO
 from sqlalchemy import insert, select, update
 
@@ -36,7 +36,7 @@ class UserRepository:
 
 
     # 2. 회원 정보 조회(social_provider, social_id) - 소셜 로그인용
-    async def find_user_by_social(self, social_provider: SocialProvider, social_id: str) -> User | None:
+    async def find_user_by_social(self, social_provider: UserSocialProvider, social_id: str) -> User | None:
         query = (
             select(User)
             .where(

@@ -5,9 +5,9 @@ from fastapi import Depends
 from app.infrastructure.postgresql import get_postgresql_db
 
 # 모델, ORM
-from app.model.user_model import User
-from app.model.user_setting_model import UserSetting
-from app.model.care_relation_model import CareRelation
+from app.models.user_model import User
+from app.models.user_setting_model import UserSetting
+from app.models.care_relation_model import CareRelation
 
 
 # 마이페이지 DB 접근 (조회/저장만 담당, 비즈니스 규칙은 service에서 처리)

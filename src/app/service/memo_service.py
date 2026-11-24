@@ -1,7 +1,7 @@
 from typing import Literal
 from fastapi import Depends, HTTPException, status
 from app.repository.memo_repository import MemoRepository, get_memo_repository
-from app.model.doctor_memo_model import DoctorMemo
+from app.models.doctor_memo_model import DoctorMemo
 from app.schema.memo_schema import (
     MemoCreateDTO,
     MemoUpdateDTO,

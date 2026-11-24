@@ -3,7 +3,7 @@ from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
 from fastapi import Depends, HTTPException, status
 from app.repository.diary_repository import DiaryRepository, get_diary_repository
-from app.model.diary_model import Diary
+from app.models.diary_model import Diary
 from app.schema.common_schema import PageRequestDTO, PageResponseDTO
 from app.schema.diary_schema import DiaryCreateDTO, DiaryUpdateDTO, DiaryResponseDTO
 

@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from app.infrastructure.postgresql import engine, Base
 from app.infrastructure.redis import start_redis_client
 from app.infrastructure.s3 import start_s3_client
-import app.model
+import app.models
 from app.api import default_api, auth_api, user_api, memo_api, doctor_verification_api, mypage_api, mood_record_api, reflection_api, diary_api, calendar_api, care_task_api
 
 @asynccontextmanager
