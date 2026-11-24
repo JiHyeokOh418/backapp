@@ -59,7 +59,8 @@ EMOTION_FIELDS = ("anger", "joy", "anxiety", "embarrassment", "sadness", "hurt")
 # 세션 종료 경로는 두 가지다. 둘 다 종료할 때 summary_status=PENDING을 넣는다. (종료 전에는 null)
 # - 체크리스트 완료: send_message의 종료 판정 (end_reason=COMPLETED)
 # - 중간 이탈: 프론트가 상담 화면을 떠날 때 end_session으로 통지 (end_reason=USER). 종료 버튼은 없다.
-# - TIMEOUT은 나중에 서버가 방치 세션을 정리할 때 쓴다. (보류)
+# - 시작한 적 없이 마감(expires_at)이 지난 예정 세션은 process_session_timeouts가 MISSED로 바꾼다. (요청 시 처리)
+# - TIMEOUT은 나중에 강제 종료 등으로 방치된 ACTIVE 세션을 정리할 때 쓴다. (파일 맨 아래 메모, 지금은 다루지 않음)
 class LlmService:
 
     def __init__(self, repo: LlmRepository):
@@ -164,7 +165,10 @@ class LlmService:
 
     # 2. 환자: 상담 메인 (진행 중 세션, 없으면 다음 예정 세션)
     # - available(지금 접속 가능 여부)은 service가 scheduled_at과 비교해 계산
+    # - 세션 상태를 화면에 보여 주는 요청이므로, 먼저 이 환자의 마감 지난 예정 세션을 MISSED로 정리한다. (7번)
     async def get_main_session(self, user_id: int) -> MainSessionResponseDTO | None:
+        await self.process_session_timeouts(user_id)
+
         session = await self.repo.find_active_or_next_session(user_id)
         if session is None:
             return None
@@ -866,15 +870,36 @@ class LlmService:
         }
 
 
-    # 보류 (repository 함수가 추가된 뒤에 구현)
-    # - process_session_timeouts(now): expire_scheduled_sessions, end_stale_active_sessions 필요
-    #
-    # 방치 세션 처리
+    # 7. 세션 마감 정리: 한 번도 시작하지 않고 expires_at이 지난 예정 세션 -> MISSED
+    # - 세션 종료 조건은 세 가지다.
+    #   (1) LLM 출력의 정상 종료 신호 -> send_message의 종료 판정 (ENDED / COMPLETED)
+    #   (2) 상담 중 이탈 -> 프론트가 end API 호출, end_session (ENDED / USER)
+    #   (3) 시작한 적 없이 expires_at이 지남 -> 이 함수 (MISSED)
+    # - 스케줄러 없이 "요청이 들어올 때" 처리한다. 세션 상태를 프론트에 보여 줘야 하는 요청의 맨 앞에서 부른다.
+    #   지금은 get_main_session(환자 상담 메인)에서 부른다. 세션 목록·상태를 보여 주는 API(예: 의사용 세션 조회)가
+    #   생기면 그 앞에서도 부른다. (의사 화면이면 user_id=환자 id)
+    # - 기능상 접속은 이 함수 없이도 막힌다. (start_session이 expires_at을 400으로 막고, 상담 메인 조회도 마감 지난 세션을 제외)
+    #   이 함수는 DB의 status를 실제 상태와 맞추는 역할이다.
+    # - user_id를 주면 그 환자의 세션만 정리한다. None이면 전체 (나중에 배치로 돌릴 때)
+    # - 변경한 세션 수를 반환한다.
+    async def process_session_timeouts(self, user_id: int | None = None) -> int:
+        try:
+            count = await self.repo.expire_scheduled_sessions(datetime.now(KST), user_id=user_id)
+            await self.repo.commit()
+        except Exception as error:
+            await self._rollback_and_raise(error)
+        return count
+
+
+    # 방치 세션 처리 (예외 상황, 지금은 다루지 않는다)
     # - 설계: AI 상담은 접속하면 끝날 때까지 진행하고, 중간에 나가면 세션을 종료한다. (end_session)
     # - expires_at(필수)은 최초 접속(start_session) 때 한 번만 검증한다. 시작한 뒤에는 expires_at을 다시 검증하지 않는다.
     # - 세션 상태(status)는 외부 표시용이다. 접속 가능 여부의 검증 기준으로 쓰지 않는다.
-    # - 이탈 통지가 오지 않는 경우(앱 강제 종료, 네트워크 끊김)는 아직 처리하지 않는다.
-    #   그런 ACTIVE 세션은 다음 세션 시작(start_session)을 409로 막으므로, 서버 쪽 정리(process_session_timeouts)가 여전히 필요하다.
+    # TODO: 이탈 통지가 오지 않는 경우(앱 강제 종료, 네트워크 끊김)는 아직 처리하지 않는다.
+    #   그런 세션은 ACTIVE로 남아, 환자당 ACTIVE 1개 제약(exists_active_session, uix_chat_sessions_user_active) 때문에
+    #   다음 세션 시작(start_session)이 409가 된다. expires_at은 시작할 때만 검증하므로 7번에서도 잡히지 않는다.
+    #   처리 방안 후보: 마지막 메시지 이후 일정 시간이 지나면 ENDED / TIMEOUT으로 정리,
+    #   또는 start_session에서 남아 있는 ACTIVE 세션을 먼저 닫고 새 세션을 연다.
 
 
 

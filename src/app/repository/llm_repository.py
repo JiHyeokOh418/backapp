@@ -152,6 +152,31 @@ class LlmRepository:
         return session
 
 
+    # 5-1. 마감(expires_at)이 지난 예정 세션을 MISSED로 일괄 변경 (변경한 행 수 반환)
+    # - 대상: status=SCHEDULED이고 expires_at <= now (한 번도 시작하지 않은 세션)
+    # - user_id를 주면 그 환자의 세션만, 안 주면 전체
+    # - end_reason, ended_at, summary_status는 건드리지 않는다. (열린 적이 없어 "종료"가 아니고, 요약 대상도 아니다)
+    # - start_session이 같은 행을 잠그고 있으면 그 트랜잭션이 끝날 때까지 기다린 뒤 WHERE를 다시 확인한다.
+    #   그사이 ACTIVE가 됐으면 바꾸지 않는다. (PostgreSQL READ COMMITTED)
+    async def expire_scheduled_sessions(self, now: datetime, user_id: int | None = None) -> int:
+        query = (
+            update(ChatSession)
+            .where(
+                ChatSession.status == ChatSessionStatus.SCHEDULED,
+                ChatSession.expires_at.is_not(None),
+                ChatSession.expires_at <= now,
+            )
+            .values(status=ChatSessionStatus.MISSED)
+            # 같은 AsyncSession에 이미 읽은 객체가 있으면 메모리 값도 맞춰 준다.
+            .execution_options(synchronize_session="fetch")
+        )
+        if user_id is not None:
+            query = query.where(ChatSession.user_id == user_id)
+
+        result = await self.db.execute(query)
+        return result.rowcount or 0
+
+
     # 메시지
     # 6. 새 메시지 생성 (다음 seq 자동 부여)
     # - 반드시 find_session_by_id(..., for_update=True)로 세션을 잠근 상태에서 호출
