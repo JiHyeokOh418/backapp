@@ -1,0 +1,49 @@
+from datetime import date, datetime, timedelta, timezone
+from sqlalchemy import BigInteger, Integer, Date, DateTime, Identity, ForeignKey, Index, text, Enum as SQLEnum
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.enums.care_action_log_enum import CareActionLogActionType
+
+# PostgreSQL의 Base를 상속받아서 서버가 켜질 때 동기화시킨다.
+from app.infrastructure.postgresql import Base
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.models.user_model import User
+    from app.models.item_model import Item
+
+KST = timezone(timedelta(hours=9)) # UTC+9
+
+class CareActionLog(Base):
+    __tablename__ = "care_action_logs"
+
+    log_id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)  # 기록 ID
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )  # 회원 ID
+    item_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("items.item_id", ondelete="SET NULL")
+    )  # 간식·씻기기처럼 아이템을 쓴 경우
+    action_type: Mapped[CareActionLogActionType] = mapped_column(
+        SQLEnum(CareActionLogActionType, native_enum=False, values_callable=lambda e: [m.value for m in e]),
+        nullable=False
+    )  # water·sunlight·pat=무료, lullaby=15P (모두 하루 1번)
+    action_date: Mapped[date] = mapped_column(Date, nullable=False)  # 하루 1번 확인용 ('하루' = 자정)
+    exp_gain: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 오른 경험치
+    point_spent: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # 쓴 포인트
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(KST)
+    )  # 기록 시각
+
+    __table_args__ = (
+        # 하루 1번 제한: water·sunlight·pat·lullaby만 (user_id, action_type, action_date) UNIQUE
+        Index(
+            "uix_care_action_logs_user_action_daily", "user_id", "action_type", "action_date",
+            unique=True, postgresql_where=text("action_type IN ('water','sunlight','pat','lullaby')")
+        ),
+    )
+
+    # 관계
+    user: Mapped["User"] = relationship("User", back_populates="care_action_logs")
+    item: Mapped["Item | None"] = relationship("Item")

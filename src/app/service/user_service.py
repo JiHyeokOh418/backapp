@@ -1,7 +1,7 @@
 from fastapi import Depends, HTTPException, status
 from app.repository.user_repository import UserRepository, get_user_repository
-from app.model.user_model import User
-from app.enum.user_enum import SocialProvider
+from app.models.user_model import User
+from app.enums.user_enum import UserSocialProvider
 from app.schema.user_schema import UserCreateDTO, UserClaimDTO, UserResponseDTO, UserUpdateDTO
 
 
@@ -27,7 +27,7 @@ class UserService:
 
 
     # 회원 조회(social_provider, social_id) - 없으면 None
-    async def get_user_by_social(self, social_provider: SocialProvider, social_id: str) -> User | None:
+    async def get_user_by_social(self, social_provider: UserSocialProvider, social_id: str) -> User | None:
         return await self.repo.find_user_by_social(social_provider, social_id)
 
 
