@@ -3,8 +3,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
-from app.enum.chat_enum import SessionStatus, SessionType, MessageRole, InputType, Expression
-from app.enum.checklist_enum import SkipReason
+from app.enums.chat_session_enum import ChatSessionStatus, ChatSessionType, ChatExpression
+from app.enums.message_enum import MessageRole, MessageInputType
+from app.enums.session_checklist_enum import SessionChecklistSkipReason
 from app.schema.common_schema import BaseDTO
 
 KST = timezone(timedelta(hours=9)) # UTC+9
@@ -28,7 +29,7 @@ class ChecklistChangeOutput(BaseModel):
     item_id: int = Field(description="체크리스트 항목 id")
     status: Literal["done", "skipped"] = Field(description="done: 답을 받음, skipped: 건너뜀")
     value: str | int | float | bool | None = Field(description="사용자가 답한 값. skipped이면 null")
-    skip_reason: SkipReason | None = Field(description="skipped일 때만 사유, done이면 null")
+    skip_reason: SessionChecklistSkipReason | None = Field(description="skipped일 때만 사유, done이면 null")
     evidence_seq: int | None = Field(description="근거가 된 사용자 메시지의 seq")
 
 
@@ -37,7 +38,7 @@ class LlmReplyOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reply_text: str = Field(description="사용자에게 보여줄 답변")
-    expression: Expression = Field(description="캐릭터 표정. 특별한 감정이 없으면 default")
+    expression: ChatExpression = Field(description="캐릭터 표정. 특별한 감정이 없으면 default")
     checklist_changes: list[ChecklistChangeOutput] = Field(description="이번 턴에 상태가 바뀐 항목. 없으면 빈 배열")
     asked_item_ids: list[int] = Field(description="이번 답변에서 질문한 체크리스트 항목 id. 없으면 빈 배열")
     counsel_end: bool = Field(description="체크리스트를 모두 채웠다고 판단하면 true. 최종 판단은 서버가 DB로 확인한다")
@@ -45,18 +46,38 @@ class LlmReplyOutput(BaseModel):
 
 
 # 세션 사후요약 LLM 출력 (session_summaries 1건)
-# - session_summaries의 id, session_id, created_at을 뺀 컬럼은 모두 text로 바뀔 예정이라, 전부 문자열로 받는다.
-#   (지금 mood_summary, topics, findings 컬럼은 JSONB라 문자열이 JSON 문자열로 저장된다. 테이블 수정 후 그대로 text가 된다)
-# - mood_summary: 메시지별 감정분석 점수를 보고 세션 전체의 감정 흐름을 서술한다.
-#   감정분석 데이터가 하나도 없으면 null (service가 한 번 더 강제한다)
+# - 컬럼 형식은 session_summaries 모델을 따른다.
+#   context_summary(text, 필수), mood_summary(JSONB, 필수), topics(JSONB), chief_complaint(text), findings(JSONB [{label, evidence}])
+# - mood_summary = {dominant, distribution, intensity, evidence_seqs}
+#   - dominant, distribution(6분류 평균)은 service가 emotion_analyses 점수로 직접 계산한다. LLM에게 받지 않는다.
+#   - intensity, evidence_seqs만 LLM이 정한다. (아래 MoodOutput)
+#   - 감정분석이 한 건도 없으면 mood는 null이어야 한다. (service가 한 번 더 강제한다)
+
+# 감정 흐름에서 LLM이 정하는 값
+# TODO: intensity 척도 확정 필요 (임시: 0~1 실수)
+class MoodOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    intensity: float = Field(ge=0, le=1, description="세션 전체 감정의 강도. 0(평온) ~ 1(매우 강함)")
+    evidence_seqs: list[int] = Field(description="감정 판단의 근거가 된 사용자 메시지 seq 목록")
+
+
+# AI 참고 소견 1건 (진단이 아님)
+class FindingOutput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(description="소견 이름")
+    evidence: str = Field(description="근거 (대화 내용 요약)")
+
+
 class LlmSummaryOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     context_summary: str = Field(description="다음 세션에 넘길 상담 맥락 요약")
-    mood_summary: str | None = Field(description="세션 전체의 감정 흐름 분석. 감정분석 데이터가 없으면 null")
-    topics: str = Field(description="이번 세션에서 다룬 주제")
-    chief_complaint: str = Field(description="주호소: 환자가 가장 주로 호소한 문제")
-    findings: str = Field(description="AI 참고 소견 (의사 참고용, 진단이 아님)")
+    mood: MoodOutput | None = Field(description="감정 강도와 근거 메시지. 감정분석 데이터가 없으면 null")
+    topics: list[str] = Field(description="이번 세션에서 다룬 주제 키워드. 없으면 빈 배열")
+    chief_complaint: str | None = Field(description="주호소 요약. 사전 문진(intake) 세션이 아니거나 없으면 null")
+    findings: list[FindingOutput] = Field(description="AI 참고 소견 (진단이 아님). 없으면 빈 배열")
 
 
 # ============================================================
@@ -67,8 +88,8 @@ class LlmSummaryOutput(BaseModel):
 # 세션 1건 응답
 class ChatSessionResponseDTO(BaseDTO):
     id: int
-    status: SessionStatus
-    session_type: SessionType
+    status: ChatSessionStatus
+    session_type: ChatSessionType
     scheduled_at: datetime | None = None
     expires_at: datetime | None = None
     started_at: datetime | None = None
@@ -92,7 +113,7 @@ class MessageResponseDTO(BaseDTO):
     seq: int
     role: MessageRole
     content: str
-    expression: Expression | None = None # 사용자 메시지는 None
+    expression: ChatExpression | None = None # 사용자 메시지는 None
     created_at: datetime
 
     @field_serializer("created_at")
@@ -111,7 +132,7 @@ class MessageListResponseDTO(BaseDTO):
 # - session_status: 이번 턴에 세션이 종료됐는지 프론트가 알 수 있게 함께 내려준다.
 class SendMessageResponseDTO(BaseDTO):
     message: MessageResponseDTO
-    session_status: SessionStatus
+    session_status: ChatSessionStatus
 
 
 # ============================================================
@@ -120,6 +141,7 @@ class SendMessageResponseDTO(BaseDTO):
 
 # 체크리스트 항목 선택 1건 (의사가 세션에 붙일 항목)
 # - required: 필수 항목 여부 (세션 종료 판정에 쓰인다)
+# - sort_order: 없으면 service가 요청 목록의 순서(1부터)로 채운다. (session_checklist.sort_order는 NOT NULL)
 class ChecklistItemSelectDTO(BaseDTO):
     item_id: int
     required: bool = False
@@ -131,7 +153,7 @@ class ChecklistItemSelectDTO(BaseDTO):
 # - expires_at: 최초 접속 때 한 번 검증하는 마감 시각 (필수)
 class ScheduledSessionCreateDTO(BaseDTO):
     user_id: int
-    session_type: SessionType = SessionType.COUNSELLING
+    session_type: ChatSessionType = ChatSessionType.COUNSELING
     scheduled_at: datetime
     expires_at: datetime
     checklist_items: list[ChecklistItemSelectDTO] = Field(min_length=1)
@@ -166,7 +188,7 @@ class ScheduledSessionCreateDTO(BaseDTO):
 class SendMessageRequestDTO(BaseDTO):
     client_message_id: str = Field(min_length=1, max_length=36)
     content: str = Field(max_length=2000) # TODO: 임시값. 확정 필요
-    input_type: InputType = InputType.TEXT
+    input_type: MessageInputType = MessageInputType.TEXT
 
     # 앞뒤 공백 제거, 빈 내용은 거절
     @field_validator("content")

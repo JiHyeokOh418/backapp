@@ -6,17 +6,19 @@ from app.infrastructure.postgresql import get_postgresql_db
 from fastapi import Depends
 
 # 모델, ORM
-from app.model.chat_session_model import ChatSession
-from app.model.message_model import Message
-from app.model.checklist_item_model import ChecklistItem
-from app.model.session_checklist_model import SessionChecklist
-from app.model.checklist_event_model import ChecklistEvent
-from app.model.llm_call_model import LlmCall
-from app.model.session_summary_model import SessionSummary
-from app.model.care_relation_model import CareRelation
-from app.model.emotion_analysis_model import EmotionAnalysis
-from app.enum.chat_enum import SessionStatus, MessageRole
-from app.enum.checklist_enum import ChecklistStatus, SkipReason
+from app.models.chat_session_model import ChatSession
+from app.models.message_model import Message
+from app.models.checklist_item_model import ChecklistItem
+from app.models.session_checklist_model import SessionChecklist
+from app.models.checklist_event_model import ChecklistEvent
+from app.models.llm_call_model import LlmCall
+from app.models.session_summary_model import SessionSummary
+from app.models.care_relation_model import CareRelation
+from app.models.emotion_analysis_model import EmotionAnalysis
+from app.enums.chat_session_enum import ChatSessionStatus
+from app.enums.message_enum import MessageRole
+from app.enums.common_enum import ChecklistStatus
+from app.enums.session_checklist_enum import SessionChecklistSkipReason
 from sqlalchemy import select, update, func, exists
 
 KST = timezone(timedelta(hours=9)) # UTC+9
@@ -82,7 +84,7 @@ class LlmRepository:
             select(ChatSession)
             .where(
                 ChatSession.user_id == user_id,
-                ChatSession.status == SessionStatus.ACTIVE
+                ChatSession.status == ChatSessionStatus.ACTIVE
             )
             .limit(1)
         )
@@ -96,7 +98,7 @@ class LlmRepository:
             select(ChatSession)
             .where(
                 ChatSession.user_id == user_id,
-                ChatSession.status == SessionStatus.SCHEDULED,
+                ChatSession.status == ChatSessionStatus.SCHEDULED,
                 (ChatSession.expires_at.is_(None)) | (ChatSession.expires_at > now)
             )
             .order_by(ChatSession.scheduled_at.asc(), ChatSession.id.asc())
@@ -111,7 +113,7 @@ class LlmRepository:
         query = select(
             exists().where(
                 ChatSession.user_id == user_id,
-                ChatSession.status == SessionStatus.ACTIVE
+                ChatSession.status == ChatSessionStatus.ACTIVE
             )
         )
         result = await self.db.execute(query)
@@ -127,7 +129,7 @@ class LlmRepository:
         query = select(
             exists().where(
                 ChatSession.user_id == user_id,
-                ChatSession.status != SessionStatus.CANCELLED,
+                ChatSession.status != ChatSessionStatus.CANCELLED,
                 ChatSession.scheduled_at < expires_at,
                 ChatSession.expires_at > scheduled_at
             )
@@ -139,7 +141,7 @@ class LlmRepository:
     # 5. 세션 상태 갱신
     # - find_session_by_id(..., for_update=True)로 잠가서 읽은 객체를 넘긴다.
     #   (id로 UPDATE를 따로 보내면 메모리의 객체와 DB 값이 어긋난다)
-    # - 예: update_session(session, status=SessionStatus.ENDED, end_reason=SessionEndReason.COMPLETED, ended_at=now)
+    # - 예: update_session(session, status=ChatSessionStatus.ENDED, end_reason=ChatSessionEndReason.COMPLETED, ended_at=now)
     async def update_session(self, session: ChatSession, **fields: Any) -> ChatSession:
         for key, value in fields.items():
             if not hasattr(ChatSession, key):
@@ -317,7 +319,7 @@ class LlmRepository:
         checklist: SessionChecklist,
         to_status: ChecklistStatus,
         value: Any = None,
-        skip_reason: SkipReason | None = None,
+        skip_reason: SessionChecklistSkipReason | None = None,
         evidence_message_id: int | None = None
     ) -> ChecklistEvent:
         event = ChecklistEvent(
@@ -359,7 +361,8 @@ class LlmRepository:
     # 18. LLM 호출 1회 기록 (재시도도 1회씩)
     # - fields: message_id, purpose, model, prompt_version, attempt, parse_status,
     #   validation_errors, tokens_in, tokens_out, latency_ms, status, error
-    # - 주의: 현재 모델은 llm_calls.message_id가 NOT NULL이라, 답변 메시지가 생기기 전에는 저장할 수 없다.
+    # - message_id는 nullable이다. 이 호출이 설명하는 assistant 메시지 id이고, 실패한 턴과 사후요약은 None
+    # - prompt_version, parse_status, status는 NOT NULL이다. (빠지면 flush에서 IntegrityError)
     async def create_llm_call(self, **fields: Any) -> LlmCall:
         llm_call = LlmCall(**fields)
         self.db.add(llm_call)

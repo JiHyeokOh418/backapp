@@ -82,7 +82,7 @@ async def start_session(
     )
 
 
-# 2-1. 세션 이탈 종료 (프론트가 상담 화면을 떠날 때 통지. ACTIVE -> ENDED, end_reason=timeout)
+# 2-1. 세션 이탈 종료 (프론트가 상담 화면을 떠날 때 통지. ACTIVE -> ENDED, end_reason=user)
 # - 이미 종료된 세션이면 바꾸지 않고 현재 상태를 돌려준다. (두 번 보내도 안전)
 # - 본문이 없으므로 페이지를 닫을 때 navigator.sendBeacon이나 fetch(keepalive: true)로 보낼 수 있다.
 @router.post(
