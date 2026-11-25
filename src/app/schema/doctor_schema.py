@@ -137,6 +137,10 @@ class ChatRecordResponseDTO(BaseDTO):
 # ===== F-06 AI 상담 내역 팝업 (Figma: Doctor_detailCounsil) =====
 # - 세션 목록은 PageResponseDTO[ChatRecordResponseDTO]를 그대로 쓴다.
 
+# 세션 입력 방식: 환자 메시지가 모두 text / 모두 voice / 섞임 (임의 결정 D-43)
+# - 상담 상세(F-06)와 설문 결과(F-03)에서 같이 쓴다.
+SessionInputType = Literal["text", "voice", "mixed"]
+
 # 메시지 1건의 감정 분석 (0~1 점수, dominant = 가장 강한 감정)
 # - DB는 Numeric(Decimal)이지만 JSON에서 문자열이 되지 않도록 float로 내려준다.
 class MessageEmotionDTO(BaseDTO):
@@ -169,6 +173,18 @@ class ChatSummaryDTO(BaseDTO):
     findings: dict | list | None = None   # AI 참고 소견
 
 
+# 이전·다음 세션 링크 ("‹ 이전 세션 11.05")
+class ChatSessionBriefDTO(BaseDTO):
+    id: int
+    started_at: KstDateTime
+
+
+# 세션 감정 변화 ("불안 → 기쁨"): 감정 분석이 있는 첫 환자 메시지 -> 마지막 환자 메시지의 dominant
+class EmotionChangeDTO(BaseDTO):
+    start: EmotionType
+    end: EmotionType
+
+
 # 세션 상세 (세션 정보 + 요약·태그 + 감정 변화 + 대화 전문)
 # - 감정 변화는 messages[].emotion을 순서대로 그리면 된다.
 class ChatSessionDetailResponseDTO(BaseDTO):
@@ -182,6 +198,15 @@ class ChatSessionDetailResponseDTO(BaseDTO):
     summary_status: ChatSessionSummaryStatus | None = None
     summary: ChatSummaryDTO | None = None
     messages: list[ChatMessageResponseDTO]
+    session_code: str                       # 세션 번호 "A-MMDD" (임의 결정 D-41)
+    duration_minutes: int | None = None     # 소요 시간(분, 버림). 시작·종료 중 하나라도 없으면 null
+    prev_session: ChatSessionBriefDTO | None = None  # 같은 환자·같은 종류의 바로 앞 세션 (임의 결정 D-42)
+    next_session: ChatSessionBriefDTO | None = None  # 바로 뒤 세션
+    input_type: SessionInputType | None = None       # 환자 메시지가 없으면 null (임의 결정 D-43)
+    emotion_change: EmotionChangeDTO | None = None   # 분석된 환자 메시지가 1개 이하면 null
+    risk_count: int = 0                              # 이 세션 메시지에서 감지된 위험 알림 수
+    max_risk_level: RiskEventLevel | None = None     # 그중 가장 높은 등급 (없으면 null)
+    turn_count: int = 0                              # 환자 메시지 수 (환자 1 + AI 1 = 1턴, 임의 결정 D-44)
 
 
 # ===== F-05 위험 감지 상세 팝업 (Figma: Doctor_detailRisk) =====
@@ -208,6 +233,14 @@ class RiskEventActionResponseDTO(BaseDTO):
     created_at: KstDateTime
 
 
+# 이전 유사 기록 ("최근 30일 유사 표현 1회 (10.17 "…")", 임의 결정 D-48)
+class RiskSimilarHistoryDTO(BaseDTO):
+    count: int                              # 최근 30일 같은 category(없으면 같은 origin) 알림 수 (이 알림 제외)
+    latest_id: int | None = None            # 그중 가장 최근 알림
+    latest_at: KstDateTime | None = None
+    latest_evidence: str | None = None
+
+
 # 감지 상세
 class RiskEventDetailResponseDTO(BaseDTO):
     id: int
@@ -230,6 +263,9 @@ class RiskEventDetailResponseDTO(BaseDTO):
     session_id: int | None = None           # 대화에서 감지됐으면 그 세션 (상담 내역 팝업으로 이동용)
     context: list[RiskContextMessageDTO]    # 앞뒤 6개 메시지 (대화가 아니면 빈 목록)
     actions: list[RiskEventActionResponseDTO]  # 조치 이력 (오래된 순)
+    session_code: str | None = None         # 출처 "AI 상담 · 세션 #A-1022" (대화가 아니면 null, 임의 결정 D-41)
+    doctor_name: str | None = None          # 지금 담당 의사 (여러 명이면 담당 시작이 가장 이른 1명, 임의 결정 D-47)
+    similar_history: RiskSimilarHistoryDTO = RiskSimilarHistoryDTO(count=0)  # 이전 유사 기록
 
 
 # 조치 기록 추가 요청
@@ -266,6 +302,8 @@ class EmotionSummaryDTO(BaseDTO):
     recorded_days: int                    # 감정 기록이 있는 날 수
     total_days: int                       # 기간 일수
     top_emotion: EmotionType | None = None    # AI 상담 대화에서 가장 많이 나온 감정
+    joy_ratio: float | None = None        # AI 상담 감정 분석 중 joy 비율 (0~1, 소수 3자리). 분석이 없으면 null
+    joy_change: float | None = None       # 직전 같은 길이 기간 joy_ratio와의 차이 (0.07 -> "▲ 7%p")
 
 
 # 일별 기분 (감정 기록 체크인)
@@ -275,11 +313,11 @@ class DailyMoodDTO(BaseDTO):
     mood_tag: str | None = None
 
 
-# 주별 감정 비율 (AI 상담 대화의 환자 메시지 감정 분석, 월요일 시작 주)
+# 주별 감정 비율 (AI 상담 대화의 환자 메시지 감정 분석, 기간 첫날부터 7일씩 - 임의 결정 D-46)
 class WeeklyEmotionDTO(BaseDTO):
     week_start: date
-    total: int                       # 그 주 분석된 메시지 수
-    ratios: dict[EmotionType, float]     # 감정별 비율 (합 1.0)
+    total: int                       # 그 주 분석된 메시지 수 (없는 주도 0으로 들어간다)
+    ratios: dict[EmotionType, float]     # 감정별 비율 (합 1.0, total 0이면 모두 0)
 
 
 # 키워드 (기분 태그 빈도)
@@ -294,10 +332,19 @@ class TimeSlotCountDTO(BaseDTO):
     count: int
 
 
+# 그래프의 진료일 점선 ("진료일 · PHQ-9")
+class VisitMarkerDTO(BaseDTO):
+    date: date
+    appointment_id: int
+    phq9_score: int | None = None      # 그날(KST) 가장 늦은 PHQ-9 (없으면 null)
+    phq9_severity: str | None = None
+
+
 # 감정 리포트
 class EmotionReportResponseDTO(BaseDTO):
     patient_id: int
-    period: Literal["week", "month", "3months"]
+    patient: DoctorPatientBriefDTO      # 부제 "김민준 · 2026.10.15 – 11.11"
+    period: Literal["week", "month", "3months"]  # week 7일 / month 28일 / 3months 84일 (임의 결정 D-45)
     start_date: date    # 기간 첫날
     end_date: date      # 기간 마지막 날 (포함)
     summary: EmotionSummaryDTO
@@ -305,6 +352,7 @@ class EmotionReportResponseDTO(BaseDTO):
     weekly_emotions: list[WeeklyEmotionDTO]
     keywords: list[EmotionKeywordDTO]   # 많이 쓴 순 최대 10개
     time_slots: list[TimeSlotCountDTO]
+    visit_markers: list[VisitMarkerDTO] = []   # 기간 안 내 진료(completed) 날짜순
 
 
 # ===== F-03 설문조사 결과 팝업 (Figma: Doctor_detailsurvey) =====
@@ -316,6 +364,7 @@ class IntakeScoreDTO(BaseDTO):
     total_score: int | None = None
     severity: str | None = None
     assessed_at: KstDateTime | None = None
+    max_score: int                          # 만점 ("19 / 27점"), 결과가 없는 카드에도 넣는다
 
 
 # 문항별 응답 1줄
@@ -330,6 +379,15 @@ class IntakeAnswerDTO(BaseDTO):
     status: ChecklistStatus                 # pending: 안 물어봄 / done: 답함 / skipped: 건너뜀
     skip_reason: SessionChecklistSkipReason | None = None
     value: dict | list | int | float | str | bool | None = None  # 답 (JSONB 그대로)
+    score: int | None = None                # 척도 문항 점수 (done일 때만, 일반 문항은 null, 임의 결정 D-50)
+
+
+# 설문 결과 부제의 환자 정보 ("남 23세 · 113912")
+class IntakePatientInfoDTO(BaseDTO):
+    gender: UserGender | None = None
+    birth_date: date | None = None
+    age: int | None = None                  # 만 나이 (올해 생일 전이면 1 뺀다), 생년월일이 없으면 null
+    chart_no: str | None = None             # 내 병원 차트번호 (없으면 null)
 
 
 # 다른 문진으로 바꿔 보기 위한 목록 1건
@@ -352,6 +410,10 @@ class IntakeResultResponseDTO(BaseDTO):
     findings: dict | list | None = None     # AI 참고 소견
     context_summary: str | None = None
     history: list[IntakeSessionBriefDTO]    # 이 환자의 문진 목록 (최신순 최대 10개)
+    patient_info: IntakePatientInfoDTO = IntakePatientInfoDTO()
+    input_type: SessionInputType | None = None   # 환자 메시지 기준 (임의 결정 D-43)
+    duration_minutes: int | None = None          # 소요 시간(분, 버림)
+    completion_rate: int = 100                   # 필수 문항 중 done 비율 0~100 (임의 결정 D-49)
 
 
 # ===== F-07 예약 일정 팝업 (Figma: Doctor_DetailReservation) =====
