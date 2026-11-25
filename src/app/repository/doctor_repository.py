@@ -20,15 +20,16 @@ from app.models.emotion_analysis_model import EmotionAnalysis
 from app.models.session_checklist_model import SessionChecklist
 from app.models.appointment_change_model import AppointmentChange
 from app.models.schedule_model import Schedule
+from app.models.patient_chart_model import PatientChart
 from app.enums.appointment_enum import AppointmentStatus, AppointmentKind
 from app.enums.appointment_change_enum import AppointmentChangeType
 from app.enums.common_enum import Instrument, RequestedBy
 from app.enums.schedule_enum import ScheduleType
-from app.enums.risk_event_enum import RiskEventLevel, RiskEventStatus
+from app.enums.risk_event_enum import RiskEventLevel, RiskEventStatus, RiskEventOrigin
 from app.enums.risk_event_action_enum import RiskEventActionActorType, RiskEventActionAction
 from app.enums.chat_session_enum import ChatSessionType
 from app.enums.message_enum import MessageRole
-from sqlalchemy import select, update, insert, delete, func, case, exists, or_
+from sqlalchemy import select, update, insert, delete, func, case, exists, or_, and_
 
 KST = timezone(timedelta(hours=9)) # UTC+9
 
@@ -263,8 +264,11 @@ class DoctorRepository:
 
     # ===== 2단계: 환자를 고르면 바뀌는 위젯 =====
 
-    # 12. 척도 결과 (기간 안, 오래된 순 -> 그래프 x축 순서)
-    async def find_assessments(self, patient_id: int, instrument: Instrument, since: datetime) -> list[AssessmentResult]:
+    # 12. 척도 결과 (기간 [since, end) 안, 오래된 순 -> 그래프 x축 순서)
+    # - end가 없으면 지금까지 (경과 그래프 위젯). 감정 그래프의 진료일 PHQ-9는 end까지 준다.
+    async def find_assessments(
+        self, patient_id: int, instrument: Instrument, since: datetime, end: datetime | None = None
+    ) -> list[AssessmentResult]:
         query = (
             select(AssessmentResult)
             .where(
@@ -274,6 +278,8 @@ class DoctorRepository:
             )
             .order_by(AssessmentResult.assessed_at, AssessmentResult.id)
         )
+        if end is not None:
+            query = query.where(AssessmentResult.assessed_at < end)
 
         result = await self.db.execute(query)
         return list(result.scalars().all())
@@ -353,6 +359,45 @@ class DoctorRepository:
         return list(result.all())
 
 
+    # 16-1. 같은 환자·같은 종류 세션 중 (started_at, id) 순서로 바로 앞·뒤 1건씩 -> (prev, next) (임의 결정 D-42)
+    # - 시작하지 않은 세션(started_at 없음)은 건너뛴다.
+    # - 시작 시각이 같으면 id로 앞뒤를 정한다. (시각만 비교하면 같은 시각 세션을 건너뛴다)
+    # - prev_session_id 컬럼은 연결 방식이 정해지지 않아 쓰지 않는다.
+    async def find_adjacent_sessions(
+        self, user_id: int, session_type: ChatSessionType, started_at: datetime, session_id: int
+    ) -> tuple[ChatSession | None, ChatSession | None]:
+        same = (
+            ChatSession.user_id == user_id,
+            ChatSession.session_type == session_type,
+            ChatSession.started_at.is_not(None)
+        )
+        before = or_(
+            ChatSession.started_at < started_at,
+            and_(ChatSession.started_at == started_at, ChatSession.id < session_id)
+        )
+        after = or_(
+            ChatSession.started_at > started_at,
+            and_(ChatSession.started_at == started_at, ChatSession.id > session_id)
+        )
+
+        prev_query = (
+            select(ChatSession)
+            .where(*same, before)
+            .order_by(ChatSession.started_at.desc(), ChatSession.id.desc())
+            .limit(1)
+        )
+        next_query = (
+            select(ChatSession)
+            .where(*same, after)
+            .order_by(ChatSession.started_at, ChatSession.id)
+            .limit(1)
+        )
+
+        prev_session = (await self.db.execute(prev_query)).scalar_one_or_none()
+        next_session = (await self.db.execute(next_query)).scalar_one_or_none()
+        return prev_session, next_session
+
+
     # ===== F-05 위험 감지 상세 팝업 =====
 
     # 17. 환자별 감지 목록 (since 이후, 최신순)
@@ -398,6 +443,53 @@ class DoctorRepository:
                 Message.seq.between(target.seq - around, target.seq + around)
             )
             .order_by(Message.seq)
+        )
+
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
+
+
+    # 19-1. 상담 세션 1건 (세션 번호를 만들 시작·예정 시각용)
+    async def find_chat_session(self, session_id: int) -> ChatSession | None:
+        result = await self.db.execute(select(ChatSession).where(ChatSession.id == session_id))
+        return result.scalar_one_or_none()
+
+
+    # 19-2. 환자의 지금 담당 의사 이름 (담당 중인 관계 중 시작이 가장 이른 1명, 임의 결정 D-47)
+    async def find_current_doctor_name(self, patient_id: int) -> str | None:
+        query = (
+            select(User.name)
+            .join(CareRelation, CareRelation.doctor_id == User.id)
+            .where(
+                CareRelation.patient_id == patient_id,
+                CareRelation.ended_at.is_(None)
+            )
+            .order_by(CareRelation.started_at, CareRelation.relation_id)
+            .limit(1)
+        )
+
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
+
+
+    # 19-3. 같은 환자의 유사 위험 알림 [since, before) (최신순, 임의 결정 D-48)
+    # - category가 있으면 같은 category, 없으면(None·빈 문자열) 같은 origin
+    async def find_similar_risk_events(
+        self, user_id: int, category: str | None, origin: RiskEventOrigin,
+        since: datetime, before: datetime, exclude_id: int
+    ) -> list[RiskEvent]:
+        same_kind = RiskEvent.category == category if category else RiskEvent.origin == origin
+
+        query = (
+            select(RiskEvent)
+            .where(
+                RiskEvent.user_id == user_id,
+                RiskEvent.id != exclude_id,
+                same_kind,
+                RiskEvent.created_at >= since,
+                RiskEvent.created_at < before
+            )
+            .order_by(RiskEvent.created_at.desc(), RiskEvent.id.desc())
         )
 
         result = await self.db.execute(query)
@@ -497,6 +589,26 @@ class DoctorRepository:
         return list(result.all())
 
 
+    # 24-1. 기간 [start, end) 안 내가 이 환자를 진료한 completed 예약 (시각순)
+    async def find_completed_appointments(
+        self, doctor_id: int, patient_id: int, start: datetime, end: datetime
+    ) -> list[Appointment]:
+        query = (
+            select(Appointment)
+            .where(
+                Appointment.doctor_id == doctor_id,
+                Appointment.patient_id == patient_id,
+                Appointment.status == AppointmentStatus.COMPLETED,
+                Appointment.scheduled_at >= start,
+                Appointment.scheduled_at < end
+            )
+            .order_by(Appointment.scheduled_at, Appointment.appointment_id)
+        )
+
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
+
+
     # ===== F-03 설문조사 결과 팝업 =====
 
     # 25. 사전 문진 세션 1건 + 요약 + 문항별 응답(+문항 정보)
@@ -506,7 +618,8 @@ class DoctorRepository:
             select(ChatSession)
             .options(
                 selectinload(ChatSession.summary),
-                selectinload(ChatSession.checklists).selectinload(SessionChecklist.item)
+                selectinload(ChatSession.checklists).selectinload(SessionChecklist.item),
+                selectinload(ChatSession.messages)   # 입력 방식(text·voice) 판단용
             )
             .where(
                 ChatSession.user_id == patient_id,
@@ -554,6 +667,28 @@ class DoctorRepository:
 
         result = await self.db.execute(query)
         return list(result.scalars().all())
+
+
+    # 27-1. 환자 1명 (성별·생년월일)
+    async def find_patient_info(self, patient_id: int) -> User | None:
+        result = await self.db.execute(select(User).where(User.id == patient_id))
+        return result.scalar_one_or_none()
+
+
+    # 27-2. 이 환자의 병원 차트번호 (없으면 None)
+    async def find_chart_no(self, patient_id: int, hospital_id: int) -> str | None:
+        query = (
+            select(PatientChart.chart_no)
+            .where(
+                PatientChart.patient_id == patient_id,
+                PatientChart.hospital_id == hospital_id
+            )
+            .order_by(PatientChart.id)
+            .limit(1)
+        )
+
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
 
 
     # ===== F-07 예약 일정 팝업 =====
