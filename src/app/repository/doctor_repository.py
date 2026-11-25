@@ -787,6 +787,24 @@ class DoctorRepository:
         return result.rowcount > 0
 
 
+    # 38. 환자별 내 다음 예약 (now 이후, booked·waiting 중 가장 이른 1건)
+    async def find_next_appointment(self, doctor_id: int, patient_id: int, now: datetime) -> Appointment | None:
+        query = (
+            select(Appointment)
+            .where(
+                Appointment.doctor_id == doctor_id,
+                Appointment.patient_id == patient_id,
+                Appointment.scheduled_at > now,
+                Appointment.status.in_([AppointmentStatus.BOOKED, AppointmentStatus.WAITING])
+            )
+            .order_by(Appointment.scheduled_at, Appointment.appointment_id)
+            .limit(1)
+        )
+
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
+
+
 
 # 주입 팩토리 메서드
 def get_doctor_repository(db: AsyncSession = Depends(get_postgresql_db)):
