@@ -44,6 +44,7 @@ from app.schema.doctor_schema import (
     AppointmentChangeResponseDTO,
     AppointmentDetailResponseDTO,
     PatientAppointmentsResponseDTO,
+    NextAppointmentDTO,
     AppointmentCreateDTO,
     AppointmentRescheduleDTO,
     AppointmentCancelDTO,
@@ -737,13 +738,29 @@ class DoctorService:
         reschedule_count, cancel_count, no_show_count = await self.repo.count_patient_appointment_stats(doctor_id, patient_id)
         names = await self.repo.find_user_names({patient_id})
 
+        # 다음 예약 (month와 상관없이 지금 이후 가장 이른 1건)
+        next_appointment = await self.repo.find_next_appointment(doctor_id, patient_id, datetime.now(KST))
+
         return PatientAppointmentsResponseDTO(
             patient=DoctorPatientBriefDTO(id=patient_id, name=names.get(patient_id)),
             month=month,
             reschedule_count=reschedule_count,
             cancel_count=cancel_count,
             no_show_count=no_show_count,
-            items=[self._to_appointment_detail(appointment) for appointment in appointments]
+            items=[self._to_appointment_detail(appointment) for appointment in appointments],
+            next_appointment=self._to_next_appointment(next_appointment)
+        )
+
+
+    # ORM -> 다음 예약 DTO (D-day는 KST 날짜끼리 뺀다: 오늘 23시 예약도 D-0)
+    def _to_next_appointment(self, appointment: Appointment | None) -> NextAppointmentDTO | None:
+        if appointment is None:
+            return None
+
+        return NextAppointmentDTO(
+            appointment_id=appointment.appointment_id,
+            scheduled_at=appointment.scheduled_at,
+            d_day=(appointment.scheduled_at.astimezone(KST).date() - today_kst()).days
         )
 
 
