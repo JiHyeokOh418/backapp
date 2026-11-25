@@ -217,8 +217,11 @@ class LlmRepository:
 
 
     # 8. 재전송 시 이미 만든 AI 답변
-    # - after_seq(재전송된 사용자 메시지의 seq) 뒤에 있는 가장 최근 ASSISTANT 메시지
+    # - after_seq(재전송된 사용자 메시지의 seq) 뒤에 나온 첫 번째 ASSISTANT 메시지
     # - after_seq 조건이 없으면, 첫 요청이 아직 처리 중일 때 이전 턴의 답변을 잘못 돌려주게 된다.
+    # - 가장 최근(desc)이 아니라 첫 번째(asc)를 고른다. 뒤에 다른 턴이 이어졌으면 가장 최근 답변은 그 턴의 것이다.
+    #   (사용자 메시지와 답변을 잇는 컬럼은 없다. 실패한 턴(답변 없음)을 같은 id로 재전송하면 다음 턴의 답변이 잡힐 수 있으므로,
+    #    프론트는 502를 받은 메시지를 새 client_message_id로 보내야 한다)
     async def find_reply(self, session_id: int, after_seq: int) -> Message | None:
         query = (
             select(Message)
@@ -227,7 +230,7 @@ class LlmRepository:
                 Message.role == MessageRole.ASSISTANT,
                 Message.seq > after_seq
             )
-            .order_by(Message.seq.desc())
+            .order_by(Message.seq.asc())
             .limit(1)
         )
         result = await self.db.execute(query)

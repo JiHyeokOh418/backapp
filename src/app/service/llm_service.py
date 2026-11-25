@@ -1,3 +1,4 @@
+import json
 import logging
 from dataclasses import replace
 from datetime import datetime
@@ -34,6 +35,7 @@ from app.enums.chat_session_enum import (
 from app.enums.message_enum import MessageInputType, MessageRole, MessageSystemRecordStatus
 from app.enums.llm_call_enum import LlmCallParseStatus
 from app.enums.common_enum import ChecklistStatus
+from app.enums.checklist_item_enum import ChecklistItemAnswerType
 from app.enums.session_checklist_enum import SessionChecklistSkipReason
 from app.schema.llm_schema import (
     KST,
@@ -378,15 +380,22 @@ class LlmService:
         except Exception as error:
             await self._rollback_and_raise(error)
 
+        # 여기부터 트랜잭션 2 전까지는 ORM 객체 대신 값만 쓴다.
+        # - 분석/RAG의 실패 경로가 rollback하면 그 전에 읽은 ORM 객체가 모두 만료(expire)되고,
+        #   async에서 만료된 속성에 접근하면 MissingGreenlet 오류로 턴 전체가 실패하기 때문이다.
+        # - 체크리스트도 검증에는 context.checklist(값 스냅샷)를 쓰고, 저장할 때는 트랜잭션 2에서 다시 읽는다.
+        user_message_id = user_message.id
+        prev_session_id = session.prev_session_id
+
         # --- 사용자 발화 분석 ---
         # - 결과를 DB에 저장하면 아래 _build_prompt_context가 DB에서 일괄 조회해 프롬프트에 넣는다.
         # - 분석이 없거나 실패해도 상담은 계속한다. (프롬프트에는 "제공되지 않음"으로 들어간다)
-        await self._analyze_emotion(user_message)
+        await self._analyze_emotion(user_message_id, content)
         # TODO: 위험분석 (guard_checks gate=a / risk_events). _analyze_emotion과 같은 패턴으로 이 위치에 넣는다.
 
         # --- 프롬프트 조립 + LLM 호출 / 검증 루프 ---
         # 프롬프트 재료(원문 + 감정, 체크리스트, 위험, 이전 요약)는 DB에서 일괄 조회하고, RAG 검색은 턴당 1번만 한다.
-        checklists, context = await self._build_prompt_context(session)
+        context = await self._build_prompt_context(session_id, prev_session_id)
         await self.repo.commit() # 읽기 트랜잭션을 닫는다. (외부 API 호출 중 연결을 붙잡지 않기 위함)
         context = replace(context, references=await self._retrieve_references(context.conversation))
 
@@ -400,7 +409,7 @@ class LlmService:
             if parsed is None:
                 errors = ["응답을 지정된 JSON 형식으로 해석하지 못했습니다."]
             else:
-                errors = await self._validate_llm_output(session_id, parsed, checklists)
+                errors = await self._validate_llm_output(session_id, parsed, context.checklist)
 
             record["validation_errors"] = errors or None
             if errors:
@@ -422,7 +431,7 @@ class LlmService:
         try:
             session = await self._get_locked_active_session(user_id, session_id)
             # TODO: 출력 안전필터 (guard_checks gate=OUT), 감정분석
-            reply = await self._save_turn_result(session, checklists, output, llm_call_records)
+            reply = await self._save_turn_result(session, output, llm_call_records)
         except Exception as error:
             await self._rollback_and_raise(error)
 
@@ -436,37 +445,39 @@ class LlmService:
     # - 사용자 메시지를 commit한 뒤에 부른다. 추론하는 동안 세션 잠금과 DB 연결을 붙잡지 않는다.
     # - 점수는 Numeric(4,3) 컬럼에 맞춰 소수 셋째 자리로 반올림한다. (그래서 6개 합이 정확히 1이 아닐 수 있다)
     # - 모델이 없거나(로드 실패) 분석/저장이 실패해도 상담은 계속한다. 이 발화는 감정분석 없음으로 프롬프트에 들어간다.
-    async def _analyze_emotion(self, message: Message) -> None:
+    # - ORM 객체가 아니라 값(message_id, content)을 받는다. 실패 경로의 rollback 이후에도 안전하게 쓰기 위함
+    async def _analyze_emotion(self, message_id: int, content: str) -> None:
         if self.emotion_analyzer is None:
             return
 
         try:
-            result = await self.emotion_analyzer.analyze(message.content)
+            result = await self.emotion_analyzer.analyze(content)
             await self.repo.create_emotion_analysis(
-                message.id,
+                message_id,
                 model_version=result.model_version,
                 dominant=result.dominant,
                 **{field: Decimal(str(round(getattr(result, field), 3))) for field in EMOTION_FIELDS},
             )
             await self.repo.commit()
         except Exception:
-            logger.warning("감정분석 실패. 감정 정보 없이 진행합니다. (message_id=%s)", message.id, exc_info=True)
+            logger.warning("감정분석 실패. 감정 정보 없이 진행합니다. (message_id=%s)", message_id, exc_info=True)
             await self.repo.rollback()
 
 
     # 5-1. 턴 처리 내부: 프롬프트 재료 일괄 조회 (DB)
     # - 세션 원문 + 메시지별 감정분석, 체크리스트, 이 세션의 위험 감지 기록, 직전 세션 요약
-    # - 반환: (체크리스트 ORM, LLM 입력). 체크리스트 ORM은 검증(_validate_llm_output)과 저장(_save_turn_result)에 쓴다.
+    # - 반환: LLM 입력 (값만 담은 dataclass). context.checklist는 검증(_validate_llm_output)에도 쓴다.
+    #   ORM 객체를 돌려주지 않는다. 이후 실패 경로의 rollback으로 만료되면 접근할 때 오류가 나기 때문이다.
     # - RAG 검색 결과(references)는 여기서 채우지 않는다. 읽기 트랜잭션을 닫은 뒤 _retrieve_references로 채운다.
     # - 위험 신호 구분 (llm_call.ReplyContext.risk_signals)
     #   - 이번 사용자 발화에 입력 검사(guard_checks gate=a) 기록이 있으면 분석한 것으로 보고 목록을 넘긴다. (감지 없으면 [])
     #   - 기록이 없으면 None ("제공되지 않음"). 분석하지 않은 발화를 위험 없음으로 넘기지 않기 위함
     async def _build_prompt_context(
-        self, session: ChatSession
-    ) -> tuple[list[SessionChecklist], ReplyContext]:
-        rows = await self.repo.find_messages_with_emotions(session.id)
-        checklists = await self.repo.find_session_checklist(session.id)
-        risk_rows = await self.repo.find_session_risk_events(session.id)
+        self, session_id: int, prev_session_id: int | None
+    ) -> ReplyContext:
+        rows = await self.repo.find_messages_with_emotions(session_id)
+        checklists = await self.repo.find_session_checklist(session_id)
+        risk_rows = await self.repo.find_session_risk_events(session_id)
 
         latest_user_message = next(
             (message for message, _ in reversed(rows) if message.role == MessageRole.USER), None
@@ -478,11 +489,11 @@ class LlmService:
         risk_signals = self._to_risk_signals(risk_rows) if analyzed else None
 
         previous_summary: str | None = None
-        if session.prev_session_id is not None:
-            summary = await self.repo.find_session_summary(session.prev_session_id)
+        if prev_session_id is not None:
+            summary = await self.repo.find_session_summary(prev_session_id)
             previous_summary = summary.context_summary if summary else None
 
-        context = ReplyContext(
+        return ReplyContext(
             conversation=self._to_conversation(rows),
             checklist=self._to_checklist_entries(checklists),
             risk_signals=risk_signals,
@@ -491,7 +502,6 @@ class LlmService:
             # TODO: 직전 턴의 종료 요청을 서버가 거절했는지는 아직 저장하지 않는다. 저장하게 되면 여기서 사유를 넣는다.
             end_rejected_reason=None,
         )
-        return checklists, context
 
 
     # 5-1-1. RAG 검색 (턴당 1번, LLM 재시도와 관계없이)
@@ -593,12 +603,13 @@ class LlmService:
 
     # 5-3. 턴 처리 내부: LLM 출력 검증
     # - item_id가 이 세션 항목인지, 상태 전이, value와 answer_type, skip_reason, evidence_seq(사용자 메시지) 확인
+    # - checklists: 프롬프트에 넣은 체크리스트 스냅샷 (context.checklist, 값만 담은 dataclass)
     # - 반환: 오류 목록 (비어 있으면 통과)
     async def _validate_llm_output(
         self,
         session_id: int,
         output: LlmReplyOutput,
-        checklists: list[SessionChecklist],
+        checklists: list[ChecklistEntry],
     ) -> list[str]:
         errors: list[str] = []
         checklist_by_item = {checklist.item_id: checklist for checklist in checklists}
@@ -620,6 +631,14 @@ class LlmService:
                 errors.append(f"item_id {item_id}가 checklist_changes에 중복되었습니다.")
                 continue
             seen_item_ids.add(item_id)
+
+            # 상태 전이: done은 최종 상태다. 이미 받은 답을 덮어쓰지 않는다.
+            # (pending -> done/skipped, skipped -> done/skipped는 허용. 건너뛴 항목도 나중에 답하면 done이 될 수 있다)
+            if not self._is_allowed_transition(checklist.status):
+                errors.append(
+                    f"item_id {item_id}는 이미 done인 항목입니다. 이미 done인 항목은 checklist_changes에 넣지 마세요."
+                )
+                continue
 
             if change.status == "skipped":
                 # skipped: skip_reason 필수, value는 null
@@ -655,12 +674,63 @@ class LlmService:
         return errors
 
 
-    # 5-3-1. 검증 내부: value가 항목의 answer_type과 응답 범위에 맞는지 (맞으면 None, 아니면 사유)
-    # - 응답 범위는 checklist_items.options(글로벌 체크리스트의 "발생 가능한 응답 범위")에 있다. (checklist.item.options)
-    # TODO: answer_type(boolean / number / scale / choice / text)별 검증 함수는 구상 후 작성한다.
-    #       지금은 모든 값을 통과시킨다.
+    # 5-3-0. 검증/저장 공통: 현재 상태에서 checklist_changes로 바꿀 수 있는지
+    # - done은 최종 상태라 바꿀 수 없다. pending, skipped에서는 done/skipped로 바꿀 수 있다.
+    # - status는 스냅샷의 문자열("done")과 ORM의 ChecklistStatus 둘 다 받는다.
     @staticmethod
-    def _check_value(checklist: SessionChecklist, value: Any) -> str | None:
+    def _is_allowed_transition(from_status: ChecklistStatus | str) -> bool:
+        return ChecklistStatus(from_status) != ChecklistStatus.DONE
+
+
+    # 5-3-1. 검증 내부: value가 항목의 answer_type과 응답 범위에 맞는지 (맞으면 None, 아니면 사유)
+    # - 응답 범위는 checklist_items.options(글로벌 체크리스트의 "발생 가능한 응답 범위")에 있다. (checklist.options)
+    # - answer_type별 value 규칙과 options 형식
+    #   - boolean: true / false                    | options: null
+    #   - number : 숫자(정수·실수), min <= 값 <= max | options: {"min": 1, "max": 30}  (일반 질문)
+    #   - scale  : 정수, min <= 값 <= max           | options: {"min": 0, "max": 9}   (척도 기반 검사)
+    #   - choice : label 중 하나 (문자열 그대로)      | options: {"label": ["a", "b", "c"]}
+    #   - text   : 비어 있지 않은 문자열              | options: null (도메인 검증 없음)
+    # - bool은 Python에서 int의 하위 타입이라 number·scale에서 따로 거절한다. (true가 1로 통과하지 않게)
+    # - 숫자 문자열("5")은 변환하지 않고 거절한다. 사유가 retry_feedback으로 전달되어 재시도에서 고쳐진다.
+    # - options에 min/max/label이 없으면(데이터 누락) 그 범위 검사는 건너뛰고 타입만 확인한다.
+    #   잘못 등록된 항목 때문에 턴 전체가 실패하지 않게 하기 위함
+    @staticmethod
+    def _check_value(checklist: ChecklistEntry, value: Any) -> str | None:
+        answer_type = ChecklistItemAnswerType(checklist.answer_type)
+        options = checklist.options if isinstance(checklist.options, dict) else {}
+        shown = json.dumps(value, ensure_ascii=False)
+
+        if answer_type == ChecklistItemAnswerType.BOOLEAN:
+            if not isinstance(value, bool):
+                return f"answer_type이 boolean이면 value는 true 또는 false여야 합니다. (받은 값: {shown})"
+            return None
+
+        if answer_type in (ChecklistItemAnswerType.NUMBER, ChecklistItemAnswerType.SCALE):
+            if answer_type == ChecklistItemAnswerType.SCALE:
+                if isinstance(value, bool) or not isinstance(value, int):
+                    return f"answer_type이 scale이면 value는 정수여야 합니다. (받은 값: {shown})"
+            elif isinstance(value, bool) or not isinstance(value, (int, float)):
+                return f"answer_type이 number이면 value는 숫자여야 합니다. 문자열이나 true/false로 보내지 마세요. (받은 값: {shown})"
+
+            low, high = options.get("min"), options.get("max")
+            if isinstance(low, (int, float)) and value < low:
+                return f"value {shown}가 options의 min({low})보다 작습니다."
+            if isinstance(high, (int, float)) and value > high:
+                return f"value {shown}가 options의 max({high})보다 큽니다."
+            return None
+
+        if answer_type == ChecklistItemAnswerType.CHOICE:
+            if not isinstance(value, str) or not value.strip():
+                return f"answer_type이 choice이면 value는 options의 label 중 하나인 문자열이어야 합니다. (받은 값: {shown})"
+            labels = options.get("label")
+            if isinstance(labels, list) and value not in labels:
+                allowed = json.dumps(labels, ensure_ascii=False)
+                return f"value {shown}는 options의 label {allowed}에 없습니다. label 중 하나를 그대로 쓰세요."
+            return None
+
+        # text
+        if not isinstance(value, str) or not value.strip():
+            return f"answer_type이 text이면 value는 비어 있지 않은 문자열이어야 합니다. (받은 값: {shown})"
         return None
 
 
@@ -690,6 +760,16 @@ class LlmService:
         checklist_by_item = {checklist.item_id: checklist for checklist in checklists}
 
         for change in output.checklist_changes:
+            # 검증은 LLM 호출 전 스냅샷으로 했으므로, 그사이 다른 턴이 이 항목을 done으로 만들었을 수 있다.
+            # 세션을 다시 잠근 뒤 읽은 현재 상태로 한 번 더 확인하고, done이면 덮어쓰지 않고 건너뛴다.
+            checklist = checklist_by_item[change.item_id]
+            if not self._is_allowed_transition(checklist.status):
+                logger.warning(
+                    "이미 done인 체크리스트 항목 변경을 건너뜁니다. (session_id=%s, item_id=%s)",
+                    session_id, change.item_id,
+                )
+                continue
+
             evidence_message_id = None
             if change.evidence_seq is not None:
                 evidence = await self.repo.find_message_by_seq(session_id, change.evidence_seq)
@@ -703,7 +783,7 @@ class LlmService:
                 skip_reason = change.skip_reason
 
             await self.repo.record_checklist_change(
-                checklist_by_item[change.item_id],
+                checklist,
                 to_status=ChecklistStatus(change.status),
                 value=value,
                 skip_reason=skip_reason,
@@ -732,7 +812,7 @@ class LlmService:
 
 
     # 5-8. 턴 처리 내부: 재전송 시 기존 AI 답변 조회
-    # - 재전송된 사용자 메시지(seq)보다 뒤에 있는 가장 최근 ASSISTANT 메시지. 없으면 None
+    # - 재전송된 사용자 메시지(seq) 뒤에 나온 첫 번째 ASSISTANT 메시지. 없으면 None
     async def _find_reply(self, session_id: int, user_message: Message) -> Message | None:
         return await self.repo.find_reply(session_id, user_message.seq)
 
@@ -740,14 +820,16 @@ class LlmService:
     # 5-9. 턴 처리 내부: 트랜잭션 2 저장 묶음 (LLM 출력이 검증을 통과한 턴)
     # - 체크리스트 반영, 답변 메시지 저장, llm_calls 저장, 종료 처리, commit
     # - 답변 메시지가 먼저 생기므로 llm_calls는 message_id를 바로 채워 저장한다. (link_llm_calls 불필요)
+    # - 체크리스트는 세션을 다시 잠근 상태에서 새로 읽어 반영한다.
+    #   (LLM 호출 전에 읽은 ORM 객체는 만료됐거나 다른 요청 때문에 낡았을 수 있다)
     async def _save_turn_result(
         self,
         session: ChatSession,
-        checklists: list[SessionChecklist],
         output: LlmReplyOutput,
         llm_call_records: list[dict[str, Any]],
     ) -> Message:
         # 1. 체크리스트 반영
+        checklists = await self.repo.find_session_checklist(session.id)
         await self._apply_checklist_changes(session.id, output, checklists)
 
         # 2. 답변 메시지 저장

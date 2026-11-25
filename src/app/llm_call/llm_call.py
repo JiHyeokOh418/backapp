@@ -108,7 +108,7 @@ class ChecklistEntry:
     label: str
     instruction: str
     answer_type: str
-    options: Any  # choice·scale 보기와 범위 (JSONB 그대로)
+    options: Any  # 응답 범위 (JSONB 그대로). number·scale {"min","max"}, choice {"label": [...]}, 그 밖에는 null
     required: bool
     status: str  # pending / done / skipped
     ask_count: int

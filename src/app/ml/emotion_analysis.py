@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import threading
 from dataclasses import dataclass
 
 import torch
@@ -76,6 +77,7 @@ class EmotionAnalyzer:
         self.model = AutoModelForSequenceClassification.from_pretrained(model_name, revision=revision)
         self.model.to(self.device)
         self.model.eval()
+        self._lock = threading.Lock()  # predict 직렬화
 
         # 모델 출력 인덱스 -> EmotionType (라벨이 예상과 다르면 로드 단계에서 바로 실패시킨다)
         id2label: dict[int, str] = self.model.config.id2label
@@ -89,20 +91,24 @@ class EmotionAnalyzer:
         logger.info("감정분석 모델 로드 완료: %s (device=%s)", self.model_version, self.device)
 
     # 동기 추론 (CPU/GPU 연산이라 이벤트 루프에서 직접 호출하지 않는다)
+    # - 한 번에 하나씩만 추론한다. (self._lock)
+    #   여러 요청이 동시에 to_thread로 들어오면 추론끼리 CPU를 두고 경합해 크게 느려진다.
+    #   측정: 동시 8건 잠금 없음 9.18s / 잠금 0.37s (단건 약 0.05s)
     def predict(self, texts: list[str]) -> list[EmotionResult]:
         if not texts:
             return []
 
-        inputs = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=EMOTION_MAX_LENGTH,
-            return_tensors="pt",
-        ).to(self.device)
+        with self._lock:
+            inputs = self.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=EMOTION_MAX_LENGTH,
+                return_tensors="pt",
+            ).to(self.device)
 
-        with torch.inference_mode():
-            probs = self.model(**inputs).logits.softmax(dim=-1).cpu().tolist()
+            with torch.inference_mode():
+                probs = self.model(**inputs).logits.softmax(dim=-1).cpu().tolist()
 
         return [self._to_result(row) for row in probs]
 
