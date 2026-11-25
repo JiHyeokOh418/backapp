@@ -377,6 +377,13 @@ class AppointmentDetailResponseDTO(DoctorAppointmentResponseDTO):
     changes: list[AppointmentChangeResponseDTO]   # 오래된 순
 
 
+# 다음 예약 (팝업 제목 아래 "다음 예약 D-13")
+class NextAppointmentDTO(BaseDTO):
+    appointment_id: int
+    scheduled_at: KstDateTime
+    d_day: int               # 예약 날짜 - 오늘 (KST 날짜 기준, 오늘이면 0)
+
+
 # 환자별 예약 (월)
 class PatientAppointmentsResponseDTO(BaseDTO):
     patient: DoctorPatientBriefDTO
@@ -385,6 +392,7 @@ class PatientAppointmentsResponseDTO(BaseDTO):
     cancel_count: int        # 취소 횟수 (전체 기간)
     no_show_count: int       # 노쇼 횟수 (전체 기간)
     items: list[AppointmentDetailResponseDTO]  # 그 달 예약 (취소 포함, 시각순)
+    next_appointment: NextAppointmentDTO | None = None  # 지금 이후 가장 이른 booked·waiting 예약 (month와 무관)
 
 
 # 예약 추가 요청 (시각은 +09:00 같은 시간대를 꼭 붙인다)
