@@ -525,6 +525,17 @@ class LlmRepository:
         return bool(result.scalar())
 
 
+    # 감정분석
+    # 27. 사용자 메시지 1건의 감정분석 결과 저장
+    # - 사용자 메시지 1건당 1건만 만든다. (22번 find_messages_with_emotions가 1건 전제로 LEFT JOIN)
+    # - fields: emotion_analyses 컬럼명 그대로 (model_version, anger ~ hurt, dominant)
+    async def create_emotion_analysis(self, message_id: int, **fields: Any) -> EmotionAnalysis:
+        analysis = EmotionAnalysis(message_id=message_id, **fields)
+        self.db.add(analysis)
+        await self.db.flush()
+        return analysis
+
+
 
 # 주입 팩토리 메서드
 def get_llm_repository(db: AsyncSession = Depends(get_postgresql_db)):

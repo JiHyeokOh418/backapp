@@ -1,6 +1,7 @@
 import logging
 from dataclasses import replace
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, NoReturn
 
 from fastapi import Depends, HTTPException, status
@@ -18,6 +19,7 @@ from app.llm_call.llm_call import (
 )
 from app.repository.llm_repository import LlmRepository, get_llm_repository
 from app.service.rag_service import RagService, get_rag_service
+from app.ml.emotion_analysis import EmotionAnalyzer, get_emotion_analyzer
 from app.models.chat_session_model import ChatSession
 from app.models.message_model import Message
 from app.models.session_checklist_model import SessionChecklist
@@ -82,9 +84,16 @@ logger = logging.getLogger(__name__)
 class LlmService:
 
     # rag_service는 같은 요청의 DB 세션을 함께 쓴다. (FastAPI가 get_postgresql_db를 요청당 1번만 만든다)
-    def __init__(self, repo: LlmRepository, rag_service: RagService):
+    # emotion_analyzer는 lifespan에서 한 번 로드한 모델이다. 로드에 실패했으면 None (감정분석 없이 진행)
+    def __init__(
+        self,
+        repo: LlmRepository,
+        rag_service: RagService,
+        emotion_analyzer: EmotionAnalyzer | None = None,
+    ):
         self.repo = repo
         self.rag_service = rag_service
+        self.emotion_analyzer = emotion_analyzer
 
 
     # 예외가 나면 rollback하고 다시 던진다. (HTTPException 포함. 잠금도 함께 풀린다)
@@ -358,7 +367,7 @@ class LlmService:
                 await self.repo.commit() # 변경 없이 잠금만 푼다.
                 return response
 
-            await self.repo.create_message(
+            user_message = await self.repo.create_message(
                 session_id,
                 MessageRole.USER,
                 content,
@@ -369,9 +378,11 @@ class LlmService:
         except Exception as error:
             await self._rollback_and_raise(error)
 
-        # TODO: 사용자 발화 분석 (감정분석 -> emotion_analyses, 위험분석 -> guard_checks gate=a / risk_events)
-        # - 이 위치에서 실행해 결과를 DB에 저장한다. 아래 _build_prompt_context가 DB에서 일괄 조회해 프롬프트에 넣는다.
+        # --- 사용자 발화 분석 ---
+        # - 결과를 DB에 저장하면 아래 _build_prompt_context가 DB에서 일괄 조회해 프롬프트에 넣는다.
         # - 분석이 없거나 실패해도 상담은 계속한다. (프롬프트에는 "제공되지 않음"으로 들어간다)
+        await self._analyze_emotion(user_message)
+        # TODO: 위험분석 (guard_checks gate=a / risk_events). _analyze_emotion과 같은 패턴으로 이 위치에 넣는다.
 
         # --- 프롬프트 조립 + LLM 호출 / 검증 루프 ---
         # 프롬프트 재료(원문 + 감정, 체크리스트, 위험, 이전 요약)는 DB에서 일괄 조회하고, RAG 검색은 턴당 1번만 한다.
@@ -419,6 +430,28 @@ class LlmService:
             message=MessageResponseDTO.model_validate(reply),
             session_status=session.status,
         )
+
+
+    # 5-0. 턴 처리 내부: 사용자 발화 감정분석 -> emotion_analyses 저장
+    # - 사용자 메시지를 commit한 뒤에 부른다. 추론하는 동안 세션 잠금과 DB 연결을 붙잡지 않는다.
+    # - 점수는 Numeric(4,3) 컬럼에 맞춰 소수 셋째 자리로 반올림한다. (그래서 6개 합이 정확히 1이 아닐 수 있다)
+    # - 모델이 없거나(로드 실패) 분석/저장이 실패해도 상담은 계속한다. 이 발화는 감정분석 없음으로 프롬프트에 들어간다.
+    async def _analyze_emotion(self, message: Message) -> None:
+        if self.emotion_analyzer is None:
+            return
+
+        try:
+            result = await self.emotion_analyzer.analyze(message.content)
+            await self.repo.create_emotion_analysis(
+                message.id,
+                model_version=result.model_version,
+                dominant=result.dominant,
+                **{field: Decimal(str(round(getattr(result, field), 3))) for field in EMOTION_FIELDS},
+            )
+            await self.repo.commit()
+        except Exception:
+            logger.warning("감정분석 실패. 감정 정보 없이 진행합니다. (message_id=%s)", message.id, exc_info=True)
+            await self.repo.rollback()
 
 
     # 5-1. 턴 처리 내부: 프롬프트 재료 일괄 조회 (DB)
@@ -1051,5 +1084,6 @@ class LlmService:
 def get_llm_service(
     repo: LlmRepository = Depends(get_llm_repository),
     rag_service: RagService = Depends(get_rag_service),
+    emotion_analyzer: EmotionAnalyzer | None = Depends(get_emotion_analyzer),
 ):
-    return LlmService(repo, rag_service)
+    return LlmService(repo, rag_service, emotion_analyzer)

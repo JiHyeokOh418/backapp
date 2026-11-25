@@ -46,3 +46,4 @@ dependencies:
         - psycopg[binary]
         - llama_index
         - anthropic
+        - transformers
