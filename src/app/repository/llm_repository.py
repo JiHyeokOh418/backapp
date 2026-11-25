@@ -15,6 +15,10 @@ from app.models.llm_call_model import LlmCall
 from app.models.session_summary_model import SessionSummary
 from app.models.care_relation_model import CareRelation
 from app.models.emotion_analysis_model import EmotionAnalysis
+from app.models.risk_event_model import RiskEvent
+from app.models.guard_check_model import GuardCheck
+from app.enums.risk_event_enum import RiskEventOrigin
+from app.enums.guard_check_enum import GuardCheckGate
 from app.enums.chat_session_enum import ChatSessionStatus
 from app.enums.message_enum import MessageRole
 from app.enums.common_enum import ChecklistStatus
@@ -480,6 +484,45 @@ class LlmRepository:
 
         await self.db.flush()
         return summary
+
+
+    # 24. 세션 1건의 사후요약 (상담 턴 프롬프트의 이전 세션 요약용)
+    # - prev_session_id로 직전 세션의 요약을 찾는다. 없으면 None
+    async def find_session_summary(self, session_id: int) -> SessionSummary | None:
+        query = select(SessionSummary).where(SessionSummary.session_id == session_id)
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
+
+
+    # 위험분석 / 입력 검사
+    # 25. 세션의 위험 감지 기록 + 감지된 메시지의 seq (프롬프트의 <risk_analysis>용)
+    # - risk_events는 위험이 감지됐을 때만 생긴다. 이번 발화와 이전 발화를 seq로 구분할 수 있게 함께 돌려준다.
+    # - origin=chat(AI 상담에서 감지된 것)만 대상으로 한다.
+    async def find_session_risk_events(self, session_id: int) -> list[tuple[RiskEvent, int]]:
+        query = (
+            select(RiskEvent, Message.seq)
+            .join(Message, RiskEvent.message_id == Message.id)
+            .where(
+                Message.session_id == session_id,
+                RiskEvent.origin == RiskEventOrigin.CHAT,
+            )
+            .order_by(Message.seq.asc(), RiskEvent.id.asc())
+        )
+        result = await self.db.execute(query)
+        return [(event, seq) for event, seq in result.all()]
+
+
+    # 26. 메시지에 입력 검사(gate a: 사용자 발화 검사) 기록이 있는지
+    # - 위험 감지가 없을 때 "검사했지만 감지 없음"과 "검사하지 않음"을 구분하는 데 쓴다.
+    async def exists_input_guard_check(self, message_id: int) -> bool:
+        query = select(
+            exists().where(
+                GuardCheck.message_id == message_id,
+                GuardCheck.gate == GuardCheckGate.A,
+            )
+        )
+        result = await self.db.execute(query)
+        return bool(result.scalar())
 
 
 

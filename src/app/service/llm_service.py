@@ -1,10 +1,23 @@
+import logging
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, NoReturn
 
 from fastapi import Depends, HTTPException, status
 from sqlalchemy.exc import IntegrityError
 
+from app.llm_call import llm_call
+from app.llm_call.llm_call import (
+    ChecklistEntry,
+    ConversationMessage,
+    EmotionScores,
+    ReferenceChunk,
+    ReplyContext,
+    RiskSignal,
+    SummaryContext,
+)
 from app.repository.llm_repository import LlmRepository, get_llm_repository
+from app.service.rag_service import RagService, get_rag_service
 from app.models.chat_session_model import ChatSession
 from app.models.message_model import Message
 from app.models.session_checklist_model import SessionChecklist
@@ -49,6 +62,11 @@ FALLBACK_REPLY_TEXT = "llm답변 오류!"
 # 감정분석 6종 (emotion_analyses 컬럼명). 사후요약 LLM 입력에 메시지별로 붙인다.
 EMOTION_FIELDS = ("anger", "joy", "anxiety", "embarrassment", "sadness", "hurt")
 
+# RAG 검색 질의에 합칠 최근 사용자 발화 수 ("네", "가끔요" 같은 짧은 답만으로는 검색이 어렵다)
+RAG_QUERY_USER_TURNS = 3
+
+logger = logging.getLogger(__name__)
+
 
 # 예외처리
 # 트랜잭션 관리 (commit / rollback은 이 service에서 정한다. repository는 flush까지만)
@@ -63,8 +81,10 @@ EMOTION_FIELDS = ("anger", "joy", "anxiety", "embarrassment", "sadness", "hurt")
 # - TIMEOUT은 나중에 강제 종료 등으로 방치된 ACTIVE 세션을 정리할 때 쓴다. (파일 맨 아래 메모, 지금은 다루지 않음)
 class LlmService:
 
-    def __init__(self, repo: LlmRepository):
+    # rag_service는 같은 요청의 DB 세션을 함께 쓴다. (FastAPI가 get_postgresql_db를 요청당 1번만 만든다)
+    def __init__(self, repo: LlmRepository, rag_service: RagService):
         self.repo = repo
+        self.rag_service = rag_service
 
 
     # 예외가 나면 rollback하고 다시 던진다. (HTTPException 포함. 잠금도 함께 풀린다)
@@ -349,18 +369,22 @@ class LlmService:
         except Exception as error:
             await self._rollback_and_raise(error)
 
-        # TODO: 입력 안전필터 (guard_checks gate=IN)
+        # TODO: 사용자 발화 분석 (감정분석 -> emotion_analyses, 위험분석 -> guard_checks gate=a / risk_events)
+        # - 이 위치에서 실행해 결과를 DB에 저장한다. 아래 _build_prompt_context가 DB에서 일괄 조회해 프롬프트에 넣는다.
+        # - 분석이 없거나 실패해도 상담은 계속한다. (프롬프트에는 "제공되지 않음"으로 들어간다)
 
         # --- 프롬프트 조립 + LLM 호출 / 검증 루프 ---
-        messages, checklists = await self._build_prompt_context(session_id)
-        await self.repo.commit() # 읽기 트랜잭션을 닫는다. (LLM 호출 중 연결을 붙잡지 않기 위함)
+        # 프롬프트 재료(원문 + 감정, 체크리스트, 위험, 이전 요약)는 DB에서 일괄 조회하고, RAG 검색은 턴당 1번만 한다.
+        checklists, context = await self._build_prompt_context(session)
+        await self.repo.commit() # 읽기 트랜잭션을 닫는다. (외부 API 호출 중 연결을 붙잡지 않기 위함)
+        context = replace(context, references=await self._retrieve_references(context.conversation))
 
         output: LlmReplyOutput | None = None
         llm_call_records: list[dict[str, Any]] = []
         feedback: str | None = None
 
         for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
-            parsed, record = await self._call_llm(messages, checklists, feedback, attempt)
+            parsed, record = await self._call_llm(context, feedback, attempt)
 
             if parsed is None:
                 errors = ["응답을 지정된 JSON 형식으로 해석하지 못했습니다."]
@@ -397,35 +421,141 @@ class LlmService:
         )
 
 
-    # 5-1. 턴 처리 내부: 프롬프트 재료 조회 (세션 원문, 체크리스트)
+    # 5-1. 턴 처리 내부: 프롬프트 재료 일괄 조회 (DB)
+    # - 세션 원문 + 메시지별 감정분석, 체크리스트, 이 세션의 위험 감지 기록, 직전 세션 요약
+    # - 반환: (체크리스트 ORM, LLM 입력). 체크리스트 ORM은 검증(_validate_llm_output)과 저장(_save_turn_result)에 쓴다.
+    # - RAG 검색 결과(references)는 여기서 채우지 않는다. 읽기 트랜잭션을 닫은 뒤 _retrieve_references로 채운다.
+    # - 위험 신호 구분 (llm_call.ReplyContext.risk_signals)
+    #   - 이번 사용자 발화에 입력 검사(guard_checks gate=a) 기록이 있으면 분석한 것으로 보고 목록을 넘긴다. (감지 없으면 [])
+    #   - 기록이 없으면 None ("제공되지 않음"). 분석하지 않은 발화를 위험 없음으로 넘기지 않기 위함
     async def _build_prompt_context(
-        self, session_id: int
-    ) -> tuple[list[Message], list[SessionChecklist]]:
-        messages = await self.repo.find_messages_for_prompt(session_id)
-        checklists = await self.repo.find_session_checklist(session_id)
-        return messages, checklists
+        self, session: ChatSession
+    ) -> tuple[list[SessionChecklist], ReplyContext]:
+        rows = await self.repo.find_messages_with_emotions(session.id)
+        checklists = await self.repo.find_session_checklist(session.id)
+        risk_rows = await self.repo.find_session_risk_events(session.id)
+
+        latest_user_message = next(
+            (message for message, _ in reversed(rows) if message.role == MessageRole.USER), None
+        )
+        analyzed = (
+            latest_user_message is not None
+            and await self.repo.exists_input_guard_check(latest_user_message.id)
+        )
+        risk_signals = self._to_risk_signals(risk_rows) if analyzed else None
+
+        previous_summary: str | None = None
+        if session.prev_session_id is not None:
+            summary = await self.repo.find_session_summary(session.prev_session_id)
+            previous_summary = summary.context_summary if summary else None
+
+        context = ReplyContext(
+            conversation=self._to_conversation(rows),
+            checklist=self._to_checklist_entries(checklists),
+            risk_signals=risk_signals,
+            references=None,
+            previous_summary=previous_summary,
+            # TODO: 직전 턴의 종료 요청을 서버가 거절했는지는 아직 저장하지 않는다. 저장하게 되면 여기서 사유를 넣는다.
+            end_rejected_reason=None,
+        )
+        return checklists, context
+
+
+    # 5-1-1. RAG 검색 (턴당 1번, LLM 재시도와 관계없이)
+    # - 질의: 최근 사용자 발화 RAG_QUERY_USER_TURNS개를 합친 문장
+    # - 실패해도 상담은 계속한다. None을 돌려주면 프롬프트에 "제공되지 않음"으로 들어간다.
+    # - 검색이 연 읽기 트랜잭션은 여기서 닫는다. (LLM 호출 중 연결을 붙잡지 않기 위함)
+    async def _retrieve_references(
+        self, conversation: list[ConversationMessage]
+    ) -> list[ReferenceChunk] | None:
+        user_texts = [message.content for message in conversation if message.role == MessageRole.USER.value]
+        query = "\n".join(user_texts[-RAG_QUERY_USER_TURNS:])
+
+        try:
+            chunks = await self.rag_service.retrieve(query)
+            await self.repo.commit()
+        except Exception:
+            logger.warning("RAG 검색 실패. 참고 자료 없이 진행합니다.", exc_info=True)
+            await self.repo.rollback()
+            return None
+
+        return [
+            ReferenceChunk(source=chunk.source, title=chunk.title, content=chunk.content)
+            for chunk in chunks
+        ]
+
+
+    # 5-1-2. ORM -> LLM 입력 변환 (순수 함수)
+    @staticmethod
+    def _to_emotion(emotion: EmotionAnalysis | None) -> EmotionScores | None:
+        if emotion is None:
+            return None
+        dominant = getattr(emotion.dominant, "value", emotion.dominant)
+        return EmotionScores(
+            **{field: float(getattr(emotion, field)) for field in EMOTION_FIELDS},
+            dominant=dominant,
+        )
+
+
+    @classmethod
+    def _to_conversation(
+        cls, rows: list[tuple[Message, EmotionAnalysis | None]]
+    ) -> list[ConversationMessage]:
+        return [
+            ConversationMessage(
+                seq=message.seq,
+                role=MessageRole(message.role).value,
+                content=message.content,
+                emotion=cls._to_emotion(emotion),
+            )
+            for message, emotion in rows
+        ]
+
+
+    @staticmethod
+    def _to_checklist_entries(checklists: list[SessionChecklist]) -> list[ChecklistEntry]:
+        return [
+            ChecklistEntry(
+                item_id=checklist.item_id,
+                label=checklist.item.label,
+                instruction=checklist.item.instruction,
+                answer_type=getattr(checklist.item.answer_type, "value", checklist.item.answer_type),
+                options=checklist.item.options,
+                required=checklist.required,
+                status=ChecklistStatus(checklist.status).value,
+                ask_count=checklist.ask_count,
+            )
+            for checklist in checklists
+        ]
+
+
+    @staticmethod
+    def _to_risk_signals(risk_rows: list[tuple[Any, int]]) -> list[RiskSignal]:
+        return [
+            RiskSignal(
+                message_seq=seq,
+                level=getattr(event.level, "value", event.level),
+                category=event.category,
+                evidence=event.evidence,
+                is_uncertain=event.is_uncertain,
+            )
+            for event, seq in risk_rows
+        ]
 
 
     # 5-2. 턴 처리 내부: LLM 호출 1회 (재시도 루프는 send_message가 돈다)
+    # - context: _build_prompt_context + _retrieve_references로 만든 입력 (시도마다 같다)
     # - feedback: 이전 시도의 검증 실패 사유 (첫 호출은 None)
     # - 반환: (파싱된 출력, create_llm_call에 넘길 호출 기록). 파싱에 실패하면 출력은 None
-    # - 호출 기록 필드: purpose=LlmCallPurpose.REPLY, model, prompt_version, attempt, tokens_in, tokens_out,
-    #   latency_ms, status, error (parse_status와 validation_errors는 send_message가 채운다)
-    #   llm_calls에서 prompt_version, status, parse_status는 NOT NULL이다. 빠뜨리면 저장할 때 오류가 난다.
-    #
-    # TODO: chat_engine 미구현
-    # - LlamaIndex + ChromaDB 조합으로 구성하고, Claude에서 LlmReplyOutput 스키마의 JSON으로 출력을 받을 예정
-    # - 프롬프트와 LLM 클라이언트는 아직 없다. 둘 곳(경로)도 추후 정한다.
-    # - 모델명, API 키, 타임아웃은 os.getenv로 읽는다.
-    # - LlamaIndex를 거치면 토큰 사용량이 감싸져서 나오므로 tokens_in/tokens_out은 원본 응답(raw)에서 꺼내야 할 수 있다.
+    # - llm_call.call_reply는 예외를 던지지 않는다. 호출 기록 키는 LlmCall 컬럼명과 같다.
+    #   (parse_status와 validation_errors는 send_message가 채운다)
     async def _call_llm(
         self,
-        messages: list[Message],
-        checklists: list[SessionChecklist],
+        context: ReplyContext,
         feedback: str | None,
         attempt: int,
     ) -> tuple[LlmReplyOutput | None, dict[str, Any]]:
-        raise NotImplementedError("chat_engine(LlamaIndex + ChromaDB)이 아직 구현되지 않았습니다.")
+        return await llm_call.call_reply(replace(context, feedback=feedback, attempt=attempt))
 
 
     # 5-3. 턴 처리 내부: LLM 출력 검증
@@ -796,10 +926,7 @@ class LlmService:
     #   latency_ms, status, error (prompt_version, status는 NOT NULL. parse_status와 validation_errors는 호출한 쪽이 채운다)
     # - session_type이 INTAKE일 때만 chief_complaint를 요청하고, 아니면 null로 내라고 지시한다.
     # - has_emotion이 False면 mood를 null로 내라고 지시한다.
-    #
-    # TODO: 사후요약 전용 프롬프트와 LLM 클라이언트 미구현 (_call_llm과 같은 클라이언트를 쓸 예정)
-    # - 출력은 LlmSummaryOutput 스키마의 JSON으로 받는다.
-    # - 주호소(chief_complaint)와 AI 참고 소견(findings)은 이 프롬프트의 출력으로 요청한다.
+    # - 프롬프트: app/llm_call/prompts/session_summary_system_prompt.txt (출력은 LlmSummaryOutput 스키마)
     async def _call_summary_llm(
         self,
         summary_input: list[dict[str, Any]],
@@ -808,7 +935,24 @@ class LlmService:
         feedback: str | None,
         attempt: int,
     ) -> tuple[LlmSummaryOutput | None, dict[str, Any]]:
-        raise NotImplementedError("사후요약 프롬프트와 LLM 클라이언트가 아직 구현되지 않았습니다.")
+        conversation = [
+            ConversationMessage(
+                seq=item["seq"],
+                role=item["role"],
+                content=item["content"],
+                emotion=EmotionScores(**item["emotion"]) if item["emotion"] is not None else None,
+            )
+            for item in summary_input
+        ]
+        return await llm_call.call_summary(
+            SummaryContext(
+                conversation=conversation,
+                session_type=ChatSessionType(session_type).value,
+                has_emotion=has_emotion,
+                feedback=feedback,
+                attempt=attempt,
+            )
+        )
 
 
     # 6-4. 사후요약 내부: LLM 출력 검증 (오류 목록 반환, 비어 있으면 통과)
@@ -904,5 +1048,8 @@ class LlmService:
 
 
 # 레포지토리 주입 팩토리 함수
-def get_llm_service(repo: LlmRepository = Depends(get_llm_repository)):
-    return LlmService(repo)
+def get_llm_service(
+    repo: LlmRepository = Depends(get_llm_repository),
+    rag_service: RagService = Depends(get_rag_service),
+):
+    return LlmService(repo, rag_service)
