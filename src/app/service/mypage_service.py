@@ -118,7 +118,14 @@ class MypageService:
     # 내 정보 수정 (닉네임, 이름, 생년월일, 성별)
     async def update_profile(self, user_id: int, dto: MyProfileUpdateDTO) -> MyProfileResponseDTO:
         # exclude_unset=True: 요청에 보내지 않은 컬럼은 제외
-        
+        # 닉네임, 이름은 null로 비울 수 없다.(users.name NOT NULL)
+        update_data = dto.model_dump(exclude_unset=True)
+        for field in ("nickname", "name"):
+            if field in update_data and update_data[field] is None:
+                raise HTTPException(
+                    status_code = status.HTTP_400_BAD_REQUEST,
+                    detail="닉네임과 이름은 비울 수 없습니다."
+                )
         updated = await self.repo.update_user(user_id, dto.model_dump(exclude_unset=True))
         if not updated:
             raise HTTPException(
@@ -137,7 +144,19 @@ class MypageService:
     # 설정 수정 (숫자·기록 현황 숨기기, 의사 공유)
     async def update_setting(self, user_id: int, dto: UserSettingUpdateDTO) -> UserSettingResponseDTO:
         await self._get_user_or_404(user_id)
+        #예전 이름(share_with_doctor)으로 오면 지금 컬럼(share_report)으로 옮긴다.
+        #-DB에 share_with_doctor 컬럼이 없어서 그대로 저장하면 에러가 난다.
+        #-share_report를 같이 보내면 share_report 값이 우선
+        if dto.share_with_doctor is not None:
+            if dto.share_report:
+                dto.share_report=dto.share_with_doctor
+            dto.share_with_doctor = None
+        #공유, 동의 설정을 보냈는지(보냈으면 동의 변경 시각을 남기기)
+        consent_sent = any(getattr(dto,field)is not None for field in CONSENT_FIELDS)
+
         setting = await self.repo.upsert_setting(user_id, dto.model_dump(exclude_unset=True, exclude_none=True))
+        if dto.model_dump(exclude_unset=True, exclude_none=True):
+            await self.repo.update_setting_times(user_id, consent_sent, datetime.now(KST))
         return UserSettingResponseDTO.model_validate(setting)
 
 
