@@ -95,12 +95,14 @@ class RagRepository:
     # - query_embedding은 문서와 같은 임베딩 모델로 만든 벡터여야 한다. (rag.embed_query)
     # - max_distance를 주면 그보다 먼 청크는 뺀다. (관련 없는 청크가 프롬프트에 들어가는 것을 막는다)
     # - 프롬프트에 출처(문서 제목)를 붙일 수 있도록 document를 함께 불러온다.
+    # - document_ids를 주면 그 문서의 청크에서만 찾는다. None이면 전체 문서 (세션에 지정된 문서가 없을 때)
     # - 반환: [(청크, 거리)] 가까운 순
     async def search_chunks(
         self,
         query_embedding: list[float],
         top_k: int,
         max_distance: float | None = None,
+        document_ids: list[int] | None = None,
     ) -> list[tuple[RagChunk, float]]:
         distance = RagChunk.embedding.cosine_distance(query_embedding)
 
@@ -115,6 +117,8 @@ class RagRepository:
         )
         if max_distance is not None:
             query = query.where(distance <= max_distance)
+        if document_ids is not None:
+            query = query.where(RagChunk.document_id.in_(document_ids))
 
         result = await self.db.execute(query)
         return [(row.RagChunk, float(row.distance)) for row in result.all()]

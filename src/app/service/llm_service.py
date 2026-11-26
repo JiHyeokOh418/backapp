@@ -410,8 +410,11 @@ class LlmService:
         # --- 프롬프트 조립 + LLM 호출 / 검증 루프 ---
         # 프롬프트 재료(원문 + 감정, 체크리스트, 위험, 이전 요약)는 DB에서 일괄 조회하고, RAG 검색은 턴당 1번만 한다.
         context = await self._build_prompt_context(session_id, prev_session_id)
+        document_ids = await self.repo.find_session_document_ids(session_id)
         await self.repo.commit() # 읽기 트랜잭션을 닫는다. (외부 API 호출 중 연결을 붙잡지 않기 위함)
-        context = replace(context, references=await self._retrieve_references(context.conversation))
+        context = replace(
+            context, references=await self._retrieve_references(context.conversation, document_ids)
+        )
 
         output: LlmReplyOutput | None = None
         llm_call_records: list[dict[str, Any]] = []
@@ -532,14 +535,18 @@ class LlmService:
     # - 질의: 최근 사용자 발화 RAG_QUERY_USER_TURNS개를 합친 문장
     # - 실패해도 상담은 계속한다. None을 돌려주면 프롬프트에 "제공되지 않음"으로 들어간다.
     # - 검색이 연 읽기 트랜잭션은 여기서 닫는다. (LLM 호출 중 연결을 붙잡지 않기 위함)
+    # - 검색 범위 규칙: 세션에 지정된 문서(session_documents)가 없으면 전체 RAG 문서, 있으면 그 문서들만
+    #   기본은 "모든 세션이 전체 문서를 쓴다"이고, 의사가 범위를 좁히고 싶을 때만 session_documents에 넣는다.
+    #   세션 생성 때 전체 문서를 미리 연결하지 않는 이유: session_documents.document_id가 ondelete=RESTRICT라
+    #   연결된 문서는 RAG 재적재(replace)·정리(prune) 때 지울 수 없고, 나중에 추가된 문서도 반영되지 않기 때문
     async def _retrieve_references(
-        self, conversation: list[ConversationMessage]
+        self, conversation: list[ConversationMessage], document_ids: list[int]
     ) -> list[ReferenceChunk] | None:
         user_texts = [message.content for message in conversation if message.role == MessageRole.USER.value]
         query = "\n".join(user_texts[-RAG_QUERY_USER_TURNS:])
 
         try:
-            chunks = await self.rag_service.retrieve(query)
+            chunks = await self.rag_service.retrieve(query, document_ids=document_ids or None)
             await self.repo.commit()
         except Exception:
             logger.warning("RAG 검색 실패. 참고 자료 없이 진행합니다.", exc_info=True)

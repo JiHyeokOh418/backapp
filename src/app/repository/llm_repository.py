@@ -13,6 +13,7 @@ from app.models.session_checklist_model import SessionChecklist
 from app.models.checklist_event_model import ChecklistEvent
 from app.models.llm_call_model import LlmCall
 from app.models.session_summary_model import SessionSummary
+from app.models.session_document_model import SessionDocument
 from app.models.care_relation_model import CareRelation
 from app.models.emotion_analysis_model import EmotionAnalysis
 from app.models.risk_event_model import RiskEvent
@@ -503,6 +504,14 @@ class LlmRepository:
 
         await self.db.flush()
         return summary
+
+
+    # 23-1. 세션에 지정된 RAG 문서 id (session_documents)
+    # - 빈 목록이면 지정된 문서가 없다는 뜻이다. 그때 검색 범위(전체 문서)는 service가 정한다.
+    async def find_session_document_ids(self, session_id: int) -> list[int]:
+        query = select(SessionDocument.document_id).where(SessionDocument.session_id == session_id)
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
 
 
     # 24. 세션 1건의 사후요약 (상담 턴 프롬프트의 이전 세션 요약용)

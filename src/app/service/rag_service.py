@@ -151,12 +151,14 @@ class RagService:
     # - commit / rollback하지 않는다. 같은 요청의 다른 service와 DB 세션을 함께 쓰므로,
     #   여기서 rollback하면 그쪽에서 flush해 둔 변경까지 되돌아간다. 트랜잭션은 호출한 쪽이 정한다.
     # - 임베딩 API 오류는 그대로 던진다. 검색 실패를 어떻게 처리할지(RAG 없이 진행할지)는 호출한 쪽이 정한다.
+    # - document_ids: 검색 범위. None이면 전체 문서, 목록이면 그 문서들만 (세션에 지정된 문서, session_documents)
     # - 반환: 가까운 순. 질의가 비어 있으면 빈 목록
     async def retrieve(
         self,
         query: str,
         top_k: int | None = None,
         max_distance: float | None = None,
+        document_ids: list[int] | None = None,
     ) -> list[RetrievedChunk]:
         if not query.strip():
             return []
@@ -166,6 +168,7 @@ class RagService:
             query_embedding,
             top_k=top_k or RAG_TOP_K,
             max_distance=max_distance if max_distance is not None else RAG_MAX_DISTANCE,
+            document_ids=document_ids,
         )
 
         return [
