@@ -883,7 +883,10 @@ class DoctorService:
                 detail="내 예약만 바꿀 수 있습니다."
             )
 
-        await self._ensure_in_charge(doctor_id, appointment.patient_id)
+        # 진료 연결(request_id 있음)로 잡은 예약은 담당 관계가 생기기 전(첫 진료)이라 담당 확인을 건너뛴다.
+        # (연결-06~08: 예약 변경·취소·진료 완료를 이 API로 그대로 한다. 담당 등록은 진료 완료 후 연결-09)
+        if appointment.request_id is None:
+            await self._ensure_in_charge(doctor_id, appointment.patient_id)
         return appointment
 
 
