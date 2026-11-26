@@ -12,6 +12,14 @@ from app.models.checklist_item_model import ChecklistItem
 from app.models.session_checklist_model import SessionChecklist
 from app.models.checklist_event_model import ChecklistEvent
 from app.models.llm_call_model import LlmCall
+from app.models.session_summary_model import SessionSummary
+from app.models.session_document_model import SessionDocument
+from app.models.care_relation_model import CareRelation
+from app.models.emotion_analysis_model import EmotionAnalysis
+from app.models.risk_event_model import RiskEvent
+from app.models.guard_check_model import GuardCheck
+from app.enums.risk_event_enum import RiskEventOrigin
+from app.enums.guard_check_enum import GuardCheckGate
 from app.enums.chat_session_enum import ChatSessionStatus
 from app.enums.message_enum import MessageRole
 from app.enums.common_enum import ChecklistStatus
@@ -46,7 +54,7 @@ class LlmRepository:
     # 세션
     # 1. 예정 세션 일괄 생성 (의사 등록)
     # - flush하면 각 세션의 id가 채워져서, 같은 트랜잭션 안에서 바로 체크리스트 생성에 쓸 수 있다.
-    # - prev_session_id(직전 예정 세션)는 앞 세션 id가 필요하므로 이 함수가 돌아온 뒤 service가 채운다.
+    # - prev_session_id(직전 세션)는 service가 find_latest_session_summary로 미리 찾아서 ChatSession에 넣은 뒤 넘긴다. (없으면 None)
     async def create_sessions(self, sessions: list[ChatSession]) -> list[ChatSession]:
         self.db.add_all(sessions)
         await self.db.flush()
@@ -65,7 +73,9 @@ class LlmRepository:
         if user_id is not None:
             query = query.where(ChatSession.user_id == user_id)
         if for_update:
-            query = query.with_for_update()
+            # populate_existing: 같은 AsyncSession에서 이미 읽은 객체여도 DB의 최신 값으로 덮어쓴다.
+            # (send_message는 트랜잭션 1, 2에서 같은 세션을 다시 잠그는데, 그 사이 다른 요청이 상태를 바꿀 수 있다)
+            query = query.with_for_update().execution_options(populate_existing=True)
 
         result = await self.db.execute(query)
         return result.scalar_one_or_none()
@@ -103,12 +113,46 @@ class LlmRepository:
         return result.scalar_one_or_none()
 
 
+    # 3-1. 이전 상담 목록: 시작한 적 있고 끝난 세션 (ENDED, ABANDONED), 최근에 시작한 순
+    # - SCHEDULED, MISSED, CANCELLED는 대화가 없으므로 제외한다. ACTIVE는 "이전" 상담이 아니므로 제외한다.
+    async def find_past_sessions(self, user_id: int) -> list[ChatSession]:
+        query = (
+            select(ChatSession)
+            .where(
+                ChatSession.user_id == user_id,
+                ChatSession.status.in_([ChatSessionStatus.ENDED, ChatSessionStatus.ABANDONED]),
+                ChatSession.started_at.is_not(None),
+            )
+            .order_by(ChatSession.started_at.desc(), ChatSession.id.desc())
+        )
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
+
+
     # 4. 진행 중인 세션이 있는지 (세션 시작 전 확인)
     async def exists_active_session(self, user_id: int) -> bool:
         query = select(
             exists().where(
                 ChatSession.user_id == user_id,
                 ChatSession.status == ChatSessionStatus.ACTIVE
+            )
+        )
+        result = await self.db.execute(query)
+        return bool(result.scalar())
+
+
+    # 4-1. 접속 기간(scheduled_at ~ expires_at)이 겹치는 세션이 있는지 (세션 등록 전 확인)
+    # - 겹침 조건: 기존.scheduled_at < 새.expires_at AND 기존.expires_at > 새.scheduled_at
+    # - 취소(CANCELLED)된 세션은 제외. 시각이 비어 있는 세션은 비교 결과가 NULL이라 자동으로 빠진다.
+    async def exists_overlapping_session(
+        self, user_id: int, scheduled_at: datetime, expires_at: datetime
+    ) -> bool:
+        query = select(
+            exists().where(
+                ChatSession.user_id == user_id,
+                ChatSession.status != ChatSessionStatus.CANCELLED,
+                ChatSession.scheduled_at < expires_at,
+                ChatSession.expires_at > scheduled_at
             )
         )
         result = await self.db.execute(query)
@@ -127,6 +171,31 @@ class LlmRepository:
 
         await self.db.flush()
         return session
+
+
+    # 5-1. 마감(expires_at)이 지난 예정 세션을 MISSED로 일괄 변경 (변경한 행 수 반환)
+    # - 대상: status=SCHEDULED이고 expires_at <= now (한 번도 시작하지 않은 세션)
+    # - user_id를 주면 그 환자의 세션만, 안 주면 전체
+    # - end_reason, ended_at, summary_status는 건드리지 않는다. (열린 적이 없어 "종료"가 아니고, 요약 대상도 아니다)
+    # - start_session이 같은 행을 잠그고 있으면 그 트랜잭션이 끝날 때까지 기다린 뒤 WHERE를 다시 확인한다.
+    #   그사이 ACTIVE가 됐으면 바꾸지 않는다. (PostgreSQL READ COMMITTED)
+    async def expire_scheduled_sessions(self, now: datetime, user_id: int | None = None) -> int:
+        query = (
+            update(ChatSession)
+            .where(
+                ChatSession.status == ChatSessionStatus.SCHEDULED,
+                ChatSession.expires_at.is_not(None),
+                ChatSession.expires_at <= now,
+            )
+            .values(status=ChatSessionStatus.MISSED)
+            # 같은 AsyncSession에 이미 읽은 객체가 있으면 메모리 값도 맞춰 준다.
+            .execution_options(synchronize_session="fetch")
+        )
+        if user_id is not None:
+            query = query.where(ChatSession.user_id == user_id)
+
+        result = await self.db.execute(query)
+        return result.rowcount or 0
 
 
     # 메시지
@@ -164,10 +233,23 @@ class LlmRepository:
         return result.scalar_one_or_none()
 
 
-    # 8. 사용자 메시지에 대한 AI 답변 (재전송 시 이미 만든 답을 돌려주기 위함)
-    # TODO: messages.reply_to_id 컬럼을 추가해야 동작한다. 추가 전에 호출하면 AttributeError
-    async def find_reply(self, user_message_id: int) -> Message | None:
-        query = select(Message).where(Message.reply_to_id == user_message_id)
+    # 8. 재전송 시 이미 만든 AI 답변
+    # - after_seq(재전송된 사용자 메시지의 seq) 뒤에 나온 첫 번째 ASSISTANT 메시지
+    # - after_seq 조건이 없으면, 첫 요청이 아직 처리 중일 때 이전 턴의 답변을 잘못 돌려주게 된다.
+    # - 가장 최근(desc)이 아니라 첫 번째(asc)를 고른다. 뒤에 다른 턴이 이어졌으면 가장 최근 답변은 그 턴의 것이다.
+    #   (사용자 메시지와 답변을 잇는 컬럼은 없다. 실패한 턴(답변 없음)을 같은 id로 재전송하면 다음 턴의 답변이 잡힐 수 있으므로,
+    #    프론트는 502를 받은 메시지를 새 client_message_id로 보내야 한다)
+    async def find_reply(self, session_id: int, after_seq: int) -> Message | None:
+        query = (
+            select(Message)
+            .where(
+                Message.session_id == session_id,
+                Message.role == MessageRole.ASSISTANT,
+                Message.seq > after_seq
+            )
+            .order_by(Message.seq.asc())
+            .limit(1)
+        )
         result = await self.db.execute(query)
         return result.scalar_one_or_none()
 
@@ -328,7 +410,8 @@ class LlmRepository:
     # 18. LLM 호출 1회 기록 (재시도도 1회씩)
     # - fields: message_id, purpose, model, prompt_version, attempt, parse_status,
     #   validation_errors, tokens_in, tokens_out, latency_ms, status, error
-    # - 주의: 현재 모델은 llm_calls.message_id가 NOT NULL이라, 답변 메시지가 생기기 전에는 저장할 수 없다.
+    # - message_id는 nullable이다. 이 호출이 설명하는 assistant 메시지 id이고, 실패한 턴과 사후요약은 None
+    # - prompt_version, parse_status, status는 NOT NULL이다. (빠지면 flush에서 IntegrityError)
     async def create_llm_call(self, **fields: Any) -> LlmCall:
         llm_call = LlmCall(**fields)
         self.db.add(llm_call)
@@ -348,7 +431,139 @@ class LlmRepository:
         )
         await self.db.execute(query)
 
-    
+
+    # 세션 요약
+    # 20. 유저의 가장 최근 세션 요약
+    # - 세션 등록 때 직전 세션(prev_session_id)을 찾는 데 쓴다. 반환값의 session_id가 직전 세션 id이다.
+    # - 요약이 아직 없는 세션(진행 중, 요약 대기·실패·건너뜀)은 대상에서 빠진다. 없으면 None
+    async def find_latest_session_summary(self, user_id: int) -> SessionSummary | None:
+        query = (
+            select(SessionSummary)
+            .join(ChatSession, SessionSummary.session_id == ChatSession.id)
+            .where(ChatSession.user_id == user_id)
+            .order_by(SessionSummary.created_at.desc(), SessionSummary.id.desc())
+            .limit(1)
+        )
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
+
+
+    # 담당 관계
+    # 21. 의사가 해당 환자의 담당인지 (세션 등록 때 1회 확인)
+    # - memo_repository.exists_care_relation과 같은 쿼리 (종료되지 않은 관계만)
+    async def exists_care_relation(self, doctor_id: int, patient_id: int) -> bool:
+        query = (
+            select(CareRelation.relation_id)
+            .where(
+                CareRelation.doctor_id == doctor_id,
+                CareRelation.patient_id == patient_id,
+                CareRelation.ended_at.is_(None)
+            )
+            .limit(1)
+        )
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none() is not None
+
+
+    # 세션 사후요약
+    # 22. 사후요약 입력용: 세션 원문 전체(seq 순) + 메시지별 감정분석
+    # - 감정분석은 사용자 메시지 1건당 1건이라는 전제로 LEFT JOIN한다. (AI 답변, 분석 전 메시지는 None)
+    # - 1건이 넘게 붙으면 메시지가 중복되어 나오므로, 그 전제가 바뀌면 이 쿼리도 바꿔야 한다.
+    async def find_messages_with_emotions(
+        self, session_id: int
+    ) -> list[tuple[Message, EmotionAnalysis | None]]:
+        query = (
+            select(Message, EmotionAnalysis)
+            .outerjoin(EmotionAnalysis, EmotionAnalysis.message_id == Message.id)
+            .where(Message.session_id == session_id)
+            .order_by(Message.seq.asc())
+        )
+        result = await self.db.execute(query)
+        return [(message, emotion) for message, emotion in result.all()]
+
+
+    # 23. 사후요약 저장 (세션당 1건. 있으면 덮어쓰고, 없으면 새로 만든다)
+    # - service가 세션 행을 잠근 상태에서 부르므로, 같은 세션의 요약을 동시에 두 번 만들지 않는다.
+    # - fields는 session_summaries 컬럼명 그대로 (context_summary, mood_summary, topics, chief_complaint, findings)
+    async def upsert_session_summary(self, session_id: int, **fields: Any) -> SessionSummary:
+        for key in fields:
+            if not hasattr(SessionSummary, key):
+                raise AttributeError(f"session_summaries에 없는 컬럼: {key}")
+
+        result = await self.db.execute(
+            select(SessionSummary).where(SessionSummary.session_id == session_id)
+        )
+        summary = result.scalar_one_or_none()
+
+        if summary is None:
+            summary = SessionSummary(session_id=session_id, **fields)
+            self.db.add(summary)
+        else:
+            for key, value in fields.items():
+                setattr(summary, key, value)
+
+        await self.db.flush()
+        return summary
+
+
+    # 23-1. 세션에 지정된 RAG 문서 id (session_documents)
+    # - 빈 목록이면 지정된 문서가 없다는 뜻이다. 그때 검색 범위(전체 문서)는 service가 정한다.
+    async def find_session_document_ids(self, session_id: int) -> list[int]:
+        query = select(SessionDocument.document_id).where(SessionDocument.session_id == session_id)
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
+
+
+    # 24. 세션 1건의 사후요약 (상담 턴 프롬프트의 이전 세션 요약용)
+    # - prev_session_id로 직전 세션의 요약을 찾는다. 없으면 None
+    async def find_session_summary(self, session_id: int) -> SessionSummary | None:
+        query = select(SessionSummary).where(SessionSummary.session_id == session_id)
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
+
+
+    # 위험분석 / 입력 검사
+    # 25. 세션의 위험 감지 기록 + 감지된 메시지의 seq (프롬프트의 <risk_analysis>용)
+    # - risk_events는 위험이 감지됐을 때만 생긴다. 이번 발화와 이전 발화를 seq로 구분할 수 있게 함께 돌려준다.
+    # - origin=chat(AI 상담에서 감지된 것)만 대상으로 한다.
+    async def find_session_risk_events(self, session_id: int) -> list[tuple[RiskEvent, int]]:
+        query = (
+            select(RiskEvent, Message.seq)
+            .join(Message, RiskEvent.message_id == Message.id)
+            .where(
+                Message.session_id == session_id,
+                RiskEvent.origin == RiskEventOrigin.CHAT,
+            )
+            .order_by(Message.seq.asc(), RiskEvent.id.asc())
+        )
+        result = await self.db.execute(query)
+        return [(event, seq) for event, seq in result.all()]
+
+
+    # 26. 메시지에 입력 검사(gate a: 사용자 발화 검사) 기록이 있는지
+    # - 위험 감지가 없을 때 "검사했지만 감지 없음"과 "검사하지 않음"을 구분하는 데 쓴다.
+    async def exists_input_guard_check(self, message_id: int) -> bool:
+        query = select(
+            exists().where(
+                GuardCheck.message_id == message_id,
+                GuardCheck.gate == GuardCheckGate.A,
+            )
+        )
+        result = await self.db.execute(query)
+        return bool(result.scalar())
+
+
+    # 감정분석
+    # 27. 사용자 메시지 1건의 감정분석 결과 저장
+    # - 사용자 메시지 1건당 1건만 만든다. (22번 find_messages_with_emotions가 1건 전제로 LEFT JOIN)
+    # - fields: emotion_analyses 컬럼명 그대로 (model_version, anger ~ hurt, dominant)
+    async def create_emotion_analysis(self, message_id: int, **fields: Any) -> EmotionAnalysis:
+        analysis = EmotionAnalysis(message_id=message_id, **fields)
+        self.db.add(analysis)
+        await self.db.flush()
+        return analysis
+
+
 
 # 주입 팩토리 메서드
 def get_llm_repository(db: AsyncSession = Depends(get_postgresql_db)):

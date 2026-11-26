@@ -18,7 +18,10 @@ class ChecklistItem(Base):
         SQLEnum(ChecklistItemAnswerType, native_enum=False, values_callable=lambda e: [m.value for m in e]),
         nullable=False
     )  # 답 형태
-    options: Mapped[dict | None] = mapped_column(JSONB)  # choice·scale 보기와 범위
+    # 응답 범위 (answer_type별 형식, llm_service._check_value가 이 형식으로 검증한다)
+    # - boolean: null / number: {"min": 1, "max": 30} / scale: {"min": 0, "max": 9}
+    # - choice: {"label": ["a", "b", "c"]} / text: null (도메인 검증 없음)
+    options: Mapped[dict | None] = mapped_column(JSONB)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)  # 사용 여부
     instrument: Mapped[Instrument | None] = mapped_column(
         SQLEnum(Instrument, native_enum=False, values_callable=lambda e: [m.value for m in e])
