@@ -61,9 +61,6 @@ class CalendarService:
     def __init__(self, repo: CalendarRepository):
         self.repo = repo
 
-    # TODO: 서비스 메서드 추가
-
-def get_calendar_service(repo: CalendarRepository = Depends(get_calendar_repository)) -> CalendarService:
 
     # 기간의 기분·일기·목표 기록·일정을 한 번씩 조회해서 날짜별로 묶는다 (쿼리 5번)
     async def _collect(self, user_id: int, first_day: date, next_day: date) -> CalendarData:
