@@ -37,8 +37,40 @@ class CareTaskRepository:
          return result.scalar_one_or_none()
 
     #2. 사용 중인 목표 목록 (표시 순서대로) - 일일목표 또는 보너스
-    
+    async def find_active_mission(self, mission_type: MissionType) -> list[Mission]:
+         query = (
+              select(Mission)
+              .where(Mission.mission_type == mission_type, Mission.is_active.is_(True))
+              .order_by(Mission.sort_order, Mission.mission_id)
+         )
+         result = await self.db.execute(query)
+         return list(result.scalar().all())
+
+    #3. 목표 1개
+    async def find_mission(self, mission_id: int) -> Mission | None:
+         query = select(Mission).where(Mission.mission_id == mission_id)
+         result = await self.db.execute(query)
+         return list(result.scalar_one_or_none())
          
+    #4. 이름으로 사용 중인 일일목표 1개 (자동 완료: 일기&감정 기록&상담에서 부를 떄)
+    async def find_active_daily_goal_by_name(self, name:str) -> Mission|None:
+         query = (
+              select(Mission)
+              .where(
+                   Mission.name == name, 
+                   Mission.mission_type==MissionType.DAILY_GOAL,
+                   Mission.is_active.is_(True)
+              )
+              .limit(1)
+         )
+         result = await self.db.execute(query)
+         return result.scalars().first()
+
+    #5. 사용 중인 모두 완료 보너스 1개
+    async  
+
+
+
 
 def get_care_task_repository(db: AsyncSession = Depends(get_postgresql_db)) -> CareTaskRepository:
     return CareTaskRepository(db)
