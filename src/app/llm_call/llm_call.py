@@ -42,7 +42,8 @@ LLM_SUMMARY_EFFORT = os.getenv("LLM_SUMMARY_EFFORT", "medium")
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "8000"))  # thinking도 포함되므로 여유 있게
 LLM_SUMMARY_MAX_TOKENS = int(os.getenv("LLM_SUMMARY_MAX_TOKENS", "8000"))
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "60"))
-LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))  # service에 재시도 루프가 따로 있다
+# 타임아웃·네트워크·API 오류는 SDK 재시도만 한다. (service 재시도 루프는 출력 형식 오류만 다시 호출한다)
+LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "1"))
 ERROR_TEXT_LIMIT = 500  # llm_calls.error에 남길 최대 길이
 
 PROMPT_DIR = Path(__file__).parent / "prompts"
@@ -60,10 +61,16 @@ DEFAULT_REFERENCE_TAG = "reference_qna"
 NOT_PROVIDED = "제공되지 않음"
 
 # llm_calls.status 값
+# - success  : 호출 성공 (출력이 스키마를 통과하지 못했으면 error에 상세 사유가 남는다)
+# - error    : API·네트워크 오류, 예상하지 못한 예외
+# - timeout  : 타임아웃
+# - refusal  : 안전 분류기 거절
+# - truncated: max_tokens에서 출력이 잘림
 STATUS_SUCCESS = "success"
 STATUS_ERROR = "error"
 STATUS_TIMEOUT = "timeout"
 STATUS_REFUSAL = "refusal"
+STATUS_TRUNCATED = "truncated"
 
 EMOTION_FIELDS = ("anger", "joy", "anxiety", "embarrassment", "sadness", "hurt")
 
@@ -329,6 +336,15 @@ def _error_text(error: Exception) -> str:
     return text[:ERROR_TEXT_LIMIT]
 
 
+def _schema_error_text(error: ValidationError) -> str:
+    # 필드 경로와 사유만 남긴다. (input은 상담 원문이 섞일 수 있어 넣지 않는다)
+    details = "; ".join(
+        f"{'.'.join(str(part) for part in item['loc']) or '(전체)'}: {item['msg']}"
+        for item in error.errors(include_url=False, include_context=False, include_input=False)
+    )
+    return f"출력 스키마 검증 실패 ({error.error_count()}건): {details}"[:ERROR_TEXT_LIMIT]
+
+
 def _sum_input_tokens(usage: Any) -> int | None:
     if usage is None:
         return None
@@ -407,7 +423,7 @@ async def _call(
 
     # 출력이 max_tokens에서 잘렸다. JSON이 불완전하다.
     if response.stop_reason == "max_tokens":
-        record.update(status=STATUS_ERROR, error=f"max_tokens({max_tokens})에서 출력이 잘렸습니다.")
+        record.update(status=STATUS_TRUNCATED, error=f"max_tokens({max_tokens})에서 출력이 잘렸습니다.")
         return None, _finish(record, started)
 
     # 응답이 thinking 블록으로 시작할 수 있으므로 위치가 아니라 type으로 text를 찾는다.
@@ -417,7 +433,8 @@ async def _call(
         output = output_model.model_validate_json(text)
     except ValidationError as error:
         # 호출은 성공했지만 출력이 스키마를 통과하지 못했다. (parse_status는 service가 FAILED로 채운다)
-        record["error"] = f"출력 스키마 검증 실패: 오류 {error.error_count()}건"
+        # 상세 사유는 service가 retry_feedback으로 모델에 다시 전달한다.
+        record["error"] = _schema_error_text(error)
         return None, _finish(record, started)
 
     return output, _finish(record, started)

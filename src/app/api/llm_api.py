@@ -6,6 +6,7 @@ from app.schema.llm_schema import (
     SendMessageRequestDTO,
     ChatSessionResponseDTO,
     MainSessionResponseDTO,
+    PastSessionResponseDTO,
     MessageListResponseDTO,
     SendMessageResponseDTO,
 )
@@ -58,6 +59,27 @@ async def get_main_session(
         success=True,
         message="상담 메인 세션 조회 완료" if session else "예정된 상담 세션이 없습니다.",
         data=session
+    )
+
+
+# 1-1. 이전 상담 목록: 시작한 적 있고 끝난 세션 (ended, abandoned), 최근에 시작한 순 (없으면 data=[])
+# - 상세보기의 대화 내용은 GET /chat/sessions/{session_id}/messages로 조회한다.
+# TODO: 세션이 많아지면 페이지네이션 추가 검토
+@router.get(
+    "/sessions/history",
+    summary="이전 상담 목록 조회",
+    response_model=ApiResponseDTO[list[PastSessionResponseDTO]]
+)
+async def get_past_sessions(
+    current_user: UserClaimDTO = Depends(get_current_user),
+    llm_service: LlmService = Depends(get_llm_service)
+):
+    sessions = await llm_service.get_past_sessions(current_user.id)
+
+    return ApiResponseDTO(
+        success=True,
+        message="이전 상담 목록 조회 완료",
+        data=sessions
     )
 
 

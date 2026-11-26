@@ -112,6 +112,22 @@ class LlmRepository:
         return result.scalar_one_or_none()
 
 
+    # 3-1. 이전 상담 목록: 시작한 적 있고 끝난 세션 (ENDED, ABANDONED), 최근에 시작한 순
+    # - SCHEDULED, MISSED, CANCELLED는 대화가 없으므로 제외한다. ACTIVE는 "이전" 상담이 아니므로 제외한다.
+    async def find_past_sessions(self, user_id: int) -> list[ChatSession]:
+        query = (
+            select(ChatSession)
+            .where(
+                ChatSession.user_id == user_id,
+                ChatSession.status.in_([ChatSessionStatus.ENDED, ChatSessionStatus.ABANDONED]),
+                ChatSession.started_at.is_not(None),
+            )
+            .order_by(ChatSession.started_at.desc(), ChatSession.id.desc())
+        )
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
+
+
     # 4. 진행 중인 세션이 있는지 (세션 시작 전 확인)
     async def exists_active_session(self, user_id: int) -> bool:
         query = select(

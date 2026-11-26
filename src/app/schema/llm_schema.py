@@ -3,7 +3,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
-from app.enums.chat_session_enum import ChatSessionStatus, ChatSessionType, ChatExpression
+from app.enums.chat_session_enum import ChatSessionStatus, ChatSessionType, ChatExpression, ChatSessionEndReason
 from app.enums.message_enum import MessageRole, MessageInputType
 from app.enums.session_checklist_enum import SessionChecklistSkipReason
 from app.schema.common_schema import BaseDTO
@@ -105,6 +105,12 @@ class ChatSessionResponseDTO(BaseDTO):
 # - available: 지금 접속할 수 있는지 (진행 중이거나 scheduled_at이 지났고 마감 전)
 class MainSessionResponseDTO(ChatSessionResponseDTO):
     available: bool
+
+
+# 이전 상담 목록의 세션 1건 (상세 대화는 GET /chat/sessions/{session_id}/messages)
+# - end_reason: 화면에서 "완료"/"중간 종료" 등을 구분할 수 있게 함께 내려준다.
+class PastSessionResponseDTO(ChatSessionResponseDTO):
+    end_reason: ChatSessionEndReason | None = None
 
 
 # 메시지 1건 응답

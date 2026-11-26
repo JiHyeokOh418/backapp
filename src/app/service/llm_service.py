@@ -44,6 +44,7 @@ from app.schema.llm_schema import (
     ScheduledSessionCreateDTO,
     ChatSessionResponseDTO,
     MainSessionResponseDTO,
+    PastSessionResponseDTO,
     MessageResponseDTO,
     MessageListResponseDTO,
     SendMessageResponseDTO,
@@ -214,6 +215,15 @@ class LlmService:
         return MainSessionResponseDTO(**base.model_dump(), available=available)
 
 
+    # 2-1. 환자: 이전 상담 목록 (시작한 적 있고 끝난 세션, 최근에 시작한 순)
+    # - 상세 대화는 get_messages(GET /sessions/{session_id}/messages)로 본다.
+    # - 사후요약(소견, 감정 요약)은 의사용 정보라 내려주지 않는다.
+    # - 마감 정리(process_session_timeouts)는 부르지 않는다. 대상(MISSED)이 이 목록에 들어가지 않기 때문
+    async def get_past_sessions(self, user_id: int) -> list[PastSessionResponseDTO]:
+        sessions = await self.repo.find_past_sessions(user_id)
+        return [PastSessionResponseDTO.model_validate(session) for session in sessions]
+
+
     # 3. 환자: 세션 시작 (SCHEDULED -> ACTIVE)
     # - 본인 세션인지(user_id) 확인한다. 아니면 404
     # - expires_at 검증은 이때 한 번만 한다. (시작한 뒤에는 다시 검증하지 않는다)
@@ -333,6 +343,7 @@ class LlmService:
     # [프롬프트 조립 + LLM 호출 / 검증 루프, 최대 MAX_LLM_ATTEMPTS회]
     #  - _build_prompt_context -> _call_llm -> _validate_llm_output
     #  - 오류가 있으면 _build_retry_feedback으로 사유를 만들어 다시 호출
+    #    (출력 형식·검증 오류만 재시도. 타임아웃·네트워크·거절은 _parse_failure_errors가 None -> 바로 실패 처리)
     #  - 호출 기록은 메모리에 모은다. (llm_calls.message_id가 NOT NULL이라 연결할 메시지가 정해진 뒤에 저장)
     #  - 모두 실패하면 _save_failed_turn: 오류 문구는 messages에 저장하지 않고 502 응답으로만 내려준다.
     # [트랜잭션 2: 재잠금 -> _save_turn_result -> commit]
@@ -407,9 +418,17 @@ class LlmService:
             parsed, record = await self._call_llm(context, feedback, attempt)
 
             if parsed is None:
-                errors = ["응답을 지정된 JSON 형식으로 해석하지 못했습니다."]
+                errors = self._parse_failure_errors(record)
+                if errors is None:
+                    # 타임아웃·네트워크·API 오류·거절: 다시 호출하지 않는다. (네트워크 계열은 SDK가 이미 재시도함)
+                    record["validation_errors"] = None
+                    record["parse_status"] = LlmCallParseStatus.FAILED
+                    llm_call_records.append(record)
+                    break
             else:
                 errors = await self._validate_llm_output(session_id, parsed, context.checklist)
+
+            
 
             record["validation_errors"] = errors or None
             if errors:
@@ -734,6 +753,22 @@ class LlmService:
         return None
 
 
+    # 5-3-2. 턴 처리·사후요약 공통: 출력이 없을 때(parsed is None) 재시도 사유 (순수 함수)
+    # - 반환: 모델에 전달할 오류 목록. None이면 재시도하지 않는다.
+    # - success(스키마 검증 실패): llm_call이 남긴 필드별 사유를 그대로 전달한다.
+    # - truncated(max_tokens 잘림): 더 짧게 쓰라고 전달한다.
+    # - timeout, error, refusal: 모델이 고칠 수 있는 문제가 아니므로 None
+    #   (네트워크 계열은 SDK 재시도로 끝내고, 거절은 같은 입력이면 다시 거절될 가능성이 높다)
+    @staticmethod
+    def _parse_failure_errors(record: dict[str, Any]) -> list[str] | None:
+        status = record.get("status")
+        if status == llm_call.STATUS_SUCCESS:
+            return [f"응답이 지정된 JSON 스키마를 따르지 않았습니다. {record.get('error') or ''}".strip()]
+        if status == llm_call.STATUS_TRUNCATED:
+            return ["출력이 길이 제한에서 잘려 JSON이 완성되지 않았습니다. 문장을 더 짧게 쓰고 스키마의 필드만 채우세요."]
+        return None
+
+
     # 5-4. 턴 처리 내부: 재호출용 실패 사유 문구 (순수 함수)
     def _build_retry_feedback(self, errors: list[str]) -> str:
         lines = "\n".join(f"- {error}" for error in errors)
@@ -952,7 +987,13 @@ class LlmService:
             )
 
             if parsed is None:
-                errors = ["응답을 지정된 JSON 형식으로 해석하지 못했습니다."]
+                errors = self._parse_failure_errors(record)
+                if errors is None:
+                    # 타임아웃·네트워크·API 오류·거절: 다시 호출하지 않는다. (send_message와 같은 규칙)
+                    record["validation_errors"] = None
+                    record["parse_status"] = LlmCallParseStatus.FAILED
+                    llm_call_records.append(record)
+                    break
             else:
                 errors = self._validate_summary_output(parsed, summary_input, has_emotion)
 
