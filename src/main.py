@@ -6,8 +6,9 @@ from contextlib import asynccontextmanager
 from app.infrastructure.postgresql import engine, Base, AsyncSessionLocal
 from app.infrastructure.redis import start_redis_client
 from app.infrastructure.s3 import start_s3_client
+from app.ml.emotion_analysis import EmotionAnalyzer
 import app.models
-from app.api import default_api, auth_api, user_api, memo_api, doctor_verification_api, doctor_api, mypage_api, mood_record_api, reflection_api, diary_api, calendar_api, care_task_api, point_api
+from app.api import default_api, auth_api, user_api, memo_api, doctor_verification_api, doctor_api, mypage_api, mood_record_api, reflection_api, diary_api, calendar_api, care_task_api, point_api, llm_api
 from app.service.schedule_reminder_service import run_schedule_reminder_loop
 
 @asynccontextmanager
@@ -36,6 +37,14 @@ async def lifespan(app: FastAPI):
                     await reminder_task
                 except asyncio.CancelledError:
                     pass
+            try:
+                app.state.emotion_analyzer = await asyncio.to_thread(EmotionAnalyzer)
+                print(f"감정분석 모델 로드 성공! ({app.state.emotion_analyzer.model_version})")
+            except Exception as e:
+                app.state.emotion_analyzer = None
+                print(f"감정분석 모델 로드 실패: {e!r}")
+
+            yield
 
 app = FastAPI(
     lifespan=lifespan,
@@ -71,4 +80,6 @@ app.include_router(diary_api.router, prefix="/diaries", tags=["diaries"])
 app.include_router(care_task_api.router, prefix="/care-tasks", tags=["care-tasks"])
 app.include_router(doctor_verification_api.router, prefix="/doctor", tags=["doctor-verification"])
 app.include_router(doctor_verification_api.admin_router, prefix="/admin", tags=["admin"])
+app.include_router(llm_api.router, prefix="/chat", tags=["chat"])
+app.include_router(llm_api.doctor_router, prefix="/doctor", tags=["doctor-chat"])
 app.include_router(point_api.router, prefix="/points", tags=["points"])
