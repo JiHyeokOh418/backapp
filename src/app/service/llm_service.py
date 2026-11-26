@@ -18,7 +18,9 @@ from app.llm_call.llm_call import (
     RiskSignal,
     SummaryContext,
 )
+from app.infrastructure.postgresql import AsyncSessionLocal
 from app.repository.llm_repository import LlmRepository, get_llm_repository
+from app.repository.rag_repository import RagRepository
 from app.service.rag_service import RagService, get_rag_service
 from app.ml.emotion_analysis import EmotionAnalyzer, get_emotion_analyzer
 from app.models.chat_session_model import ChatSession
@@ -77,7 +79,8 @@ logger = logging.getLogger(__name__)
 # 트랜잭션 관리 (commit / rollback은 이 service에서 정한다. repository는 flush까지만)
 #
 # 안전필터, 감정분석은 나중에 끼워 넣는다. (send_message 안의 표시된 위치)
-# 세션 사후요약은 6번(create_session_summary). 호출 위치는 아직 정하지 않았다.
+# 세션 사후요약은 6번(create_session_summary). 세션이 ENDED가 된 요청(send_message, end_session)의 응답 뒤에
+# API가 BackgroundTasks로 run_session_summary를 호출한다. (파일 맨 아래)
 # 타임아웃 배치는 repository 함수가 추가된 뒤에 구현한다. (파일 맨 아래 메모)
 # 세션 종료 경로는 두 가지다. 둘 다 종료할 때 summary_status=PENDING을 넣는다. (종료 전에는 null)
 # - 체크리스트 완료: send_message의 종료 판정 (end_reason=COMPLETED)
@@ -1004,8 +1007,8 @@ class LlmService:
 
     # 6. 세션 사후요약 생성 (세션당 1건)
     # - 대상: status=ENDED이고 summary_status=PENDING인 세션. 대상이 아니면 아무것도 하지 않고 None
-    # - 호출 위치(종료 직후 BackgroundTasks / 배치)는 아직 정하지 않았다. 어디서 부르든 이 함수 하나로 처리한다.
-    #   BackgroundTasks로 부를 경우 요청의 DB 세션이 닫힌 뒤이므로, 새 AsyncSession으로 만든 LlmService를 써야 한다.
+    # - 호출 위치: 세션 종료 응답 뒤 BackgroundTasks -> run_session_summary (새 AsyncSession으로 만든 LlmService)
+    #   나중에 배치로 PENDING을 정리하게 되더라도 이 함수 하나로 처리한다.
     # - 저장 형식은 session_summaries 모델을 따른다.
     #   - context_summary(text), topics(JSONB, 키워드 배열), findings(JSONB, [{label, evidence}]): LLM 출력 그대로
     #   - chief_complaint(text): 사전 문진(INTAKE) 세션만 저장한다. 그 밖의 세션은 LLM이 보내도 None
@@ -1268,6 +1271,20 @@ class LlmService:
     #   처리 방안 후보: 마지막 메시지 이후 일정 시간이 지나면 ENDED / TIMEOUT으로 정리,
     #   또는 start_session에서 남아 있는 ACTIVE 세션을 먼저 닫고 새 세션을 연다.
 
+
+
+# 세션 사후요약 백그라운드 실행 (세션 종료 응답을 보낸 뒤 BackgroundTasks로 호출)
+# - 요청의 DB 세션은 응답 후 닫히므로, 새 AsyncSession으로 LlmService를 따로 만든다.
+# - 사후요약은 감정분석·RAG를 쓰지 않는다. (rag_service는 생성자 인자라 넘기기만 한다)
+# - 백그라운드 작업이라 예외를 밖으로 던지지 않고 로그만 남긴다.
+#   LLM 실패는 create_session_summary가 summary_status=FAILED로 남긴다. 그 밖의 오류(DB 등)면 PENDING으로 남는다.
+async def run_session_summary(session_id: int) -> None:
+    try:
+        async with AsyncSessionLocal() as db:
+            service = LlmService(LlmRepository(db), RagService(RagRepository(db)))
+            await service.create_session_summary(session_id)
+    except Exception:
+        logger.exception("세션 사후요약 생성 실패 (session_id=%s)", session_id)
 
 
 # 레포지토리 주입 팩토리 함수

@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Depends, Query, status
-from app.service.llm_service import get_llm_service, LlmService
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
+from app.enums.chat_session_enum import ChatSessionStatus
+from app.service.llm_service import get_llm_service, run_session_summary, LlmService
 from app.schema.user_schema import UserClaimDTO
 from app.schema.llm_schema import (
     ScheduledSessionCreateDTO,
@@ -115,10 +116,15 @@ async def start_session(
 )
 async def end_session(
     session_id: int,
+    background_tasks: BackgroundTasks,
     current_user: UserClaimDTO = Depends(get_current_user),
     llm_service: LlmService = Depends(get_llm_service)
 ):
     session = await llm_service.end_session(current_user.id, session_id)
+
+    # 사후요약은 응답을 보낸 뒤 만든다. (이미 요약된 세션이면 create_session_summary가 아무것도 하지 않는다)
+    if session.status == ChatSessionStatus.ENDED:
+        background_tasks.add_task(run_session_summary, session_id)
 
     return ApiResponseDTO(
         success=True,
@@ -165,6 +171,7 @@ async def get_messages(
 async def send_message(
     session_id: int,
     request: SendMessageRequestDTO,
+    background_tasks: BackgroundTasks,
     current_user: UserClaimDTO = Depends(get_current_user),
     llm_service: LlmService = Depends(get_llm_service)
 ):
@@ -175,6 +182,10 @@ async def send_message(
         request.content,
         request.input_type,
     )
+
+    # 체크리스트 완료로 이번 턴에 종료됐으면 응답을 보낸 뒤 사후요약을 만든다.
+    if result.session_status == ChatSessionStatus.ENDED:
+        background_tasks.add_task(run_session_summary, session_id)
 
     return ApiResponseDTO(
         success=True,
