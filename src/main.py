@@ -25,7 +25,7 @@ async def lifespan(app: FastAPI):
         async with start_s3_client(app):
             print("S3 연결 성공!")
 
-            # 4. 감정분석 모델 로드 (실패해도 서버는 뜨고, 감정분석 없이 진행)
+            # 4. 감정분석 모델 로드 (서버가 요청을 받기 전에. 실패하면 감정분석 없이 진행)
             try:
                 app.state.emotion_analyzer = await asyncio.to_thread(EmotionAnalyzer)
                 print(f"감정분석 모델 로드 성공! ({app.state.emotion_analyzer.model_version})")
@@ -33,7 +33,8 @@ async def lifespan(app: FastAPI):
                 app.state.emotion_analyzer = None
                 print(f"감정분석 모델 로드 실패: {e!r}")
 
-            # 5. 백그라운드 스케줄러 시작 (일정 알림, 진료 요청 무응답 처리)
+            # 5. 백그라운드 스케줄러 시작 (일정 알림, 진료 요청 무응답 처리. 서버 종료 시 취소)
+            # - lifespan의 yield는 이 한 곳뿐이다. yield 앞은 시작 처리, finally는 종료 처리
             background_tasks = [
                 asyncio.create_task(run_schedule_reminder_loop(AsyncSessionLocal)),
                 asyncio.create_task(run_care_request_expire_loop(AsyncSessionLocal)),
