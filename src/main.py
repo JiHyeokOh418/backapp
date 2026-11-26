@@ -8,8 +8,9 @@ from app.infrastructure.redis import start_redis_client
 from app.infrastructure.s3 import start_s3_client
 from app.ml.emotion_analysis import EmotionAnalyzer
 import app.models
-from app.api import default_api, auth_api, user_api, memo_api, doctor_verification_api, doctor_api, mypage_api, mood_record_api, reflection_api, diary_api, calendar_api, care_task_api, point_api, llm_api
+from app.api import default_api, auth_api, user_api, memo_api, doctor_verification_api, doctor_api, mypage_api, mood_record_api, reflection_api, diary_api, calendar_api, care_task_api, point_api, llm_api, care_request_api
 from app.service.schedule_reminder_service import run_schedule_reminder_loop
+from app.service.care_request_service import run_care_request_expire_loop
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -32,17 +33,19 @@ async def lifespan(app: FastAPI):
                 app.state.emotion_analyzer = None
                 print(f"감정분석 모델 로드 실패: {e!r}")
 
-            # 5. 일정 알림 스케줄러 시작 (서버 종료 시 취소)
+            # 5. 백그라운드 스케줄러 시작 (일정 알림, 진료 요청 무응답 처리. 서버 종료 시 취소)
             # - lifespan의 yield는 이 한 곳뿐이다. yield 앞은 시작 처리, finally는 종료 처리
-            reminder_task = asyncio.create_task(run_schedule_reminder_loop(AsyncSessionLocal))
+            background_tasks = [
+                asyncio.create_task(run_schedule_reminder_loop(AsyncSessionLocal)),
+                asyncio.create_task(run_care_request_expire_loop(AsyncSessionLocal)),
+            ]
             try:
                 yield
             finally:
-                reminder_task.cancel()
-                try:
-                    await reminder_task
-                except asyncio.CancelledError:
-                    pass
+                # 종료 시 스케줄러 task를 모두 멈춘다
+                for task in background_tasks:
+                    task.cancel()
+                await asyncio.gather(*background_tasks, return_exceptions=True)
 
 app = FastAPI(
     lifespan=lifespan,
@@ -81,3 +84,5 @@ app.include_router(doctor_verification_api.admin_router, prefix="/admin", tags=[
 app.include_router(llm_api.router, prefix="/chat", tags=["chat"])
 app.include_router(llm_api.doctor_router, prefix="/doctor", tags=["doctor-chat"])
 app.include_router(point_api.router, prefix="/points", tags=["points"])
+app.include_router(care_request_api.router, prefix="/care-requests", tags=["care-requests"])
+app.include_router(care_request_api.doctor_router, prefix="/doctor", tags=["doctor-care-requests"])

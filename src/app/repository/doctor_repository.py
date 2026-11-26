@@ -21,6 +21,10 @@ from app.models.session_checklist_model import SessionChecklist
 from app.models.appointment_change_model import AppointmentChange
 from app.models.schedule_model import Schedule
 from app.models.patient_chart_model import PatientChart
+from app.models.care_request_model import CareRequest
+from app.models.notification_model import Notification
+from app.enums.care_request_enum import CareRequestStatus
+from app.enums.notification_enum import NotificationType
 from app.enums.appointment_enum import AppointmentStatus, AppointmentKind
 from app.enums.appointment_change_enum import AppointmentChangeType
 from app.enums.common_enum import Instrument, RequestedBy
@@ -802,7 +806,14 @@ class DoctorRepository:
 
 
     # 34. 예약 추가 + 환자·의사 캘린더 일정 2건 (한 트랜잭션, 연결-07) -> 새 예약 id
-    async def create_appointment(self, values: dict, schedule_type: ScheduleType, title: str) -> int:
+    # - 진료 연결에서 부를 때(연결-06): request_id를 주면 같은 트랜잭션에서 요청을 booked로 바꾼다.
+    #   요청이 그 사이 connected가 아니게 됐으면(취소·다른 의사가 먼저 확정) rollback 후 None
+    # - notify_title을 주면 환자 알림 1건 (notification_type=appointment, appointment_id 연결)
+    # - 기존 POST /doctor/appointments는 두 인자 없이 부르므로 그대로 동작한다.
+    async def create_appointment(
+        self, values: dict, schedule_type: ScheduleType, title: str,
+        request_id: int | None = None, notify_title: str | None = None
+    ) -> int | None:
         now = datetime.now(KST)
         result = await self.db.execute(
             insert(Appointment)
@@ -828,6 +839,33 @@ class DoctorRepository:
                 for user_id in (values["patient_id"], values["doctor_id"])
             ]
         )
+
+        if request_id is not None:
+            result = await self.db.execute(
+                update(CareRequest)
+                .where(
+                    CareRequest.request_id == request_id,
+                    CareRequest.status == CareRequestStatus.CONNECTED,
+                    CareRequest.matched_hospital_id == values["hospital_id"]
+                )
+                .values(status=CareRequestStatus.BOOKED)
+            )
+            if result.rowcount == 0:
+                await self.db.rollback()
+                return None
+
+        if notify_title:
+            await self.db.execute(
+                insert(Notification).values(
+                    user_id=values["patient_id"],
+                    appointment_id=appointment_id,
+                    request_id=request_id,
+                    notification_type=NotificationType.APPOINTMENT,
+                    title=notify_title,
+                    sent_at=now
+                )
+            )
+
         await self.db.commit()
         return appointment_id
 
