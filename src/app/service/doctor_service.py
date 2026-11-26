@@ -7,9 +7,11 @@ from app.enums.appointment_enum import AppointmentStatus, AppointmentKind, Appoi
 from app.enums.schedule_enum import ScheduleType
 from app.enums.risk_event_enum import RiskEventLevel, RiskEventStatus
 from app.enums.risk_event_action_enum import RiskEventActionActorType
-from app.enums.common_enum import Instrument, EmotionType
+from app.enums.common_enum import Instrument, EmotionType, ChecklistStatus
+from app.enums.message_enum import MessageRole, MessageInputType
 from app.models.risk_event_model import RiskEvent
 from app.models.appointment_model import Appointment
+from app.models.message_model import Message
 from app.schema.doctor_schema import (
     DashboardSummaryResponseDTO,
     RoomResponseDTO,
@@ -24,6 +26,9 @@ from app.schema.doctor_schema import (
     AssessmentTrendResponseDTO,
     ChatRecordResponseDTO,
     ChatSessionDetailResponseDTO,
+    ChatSessionBriefDTO,
+    SessionInputType,
+    EmotionChangeDTO,
     ChatSummaryDTO,
     ChatMessageResponseDTO,
     MessageEmotionDTO,
@@ -31,16 +36,19 @@ from app.schema.doctor_schema import (
     RiskContextMessageDTO,
     RiskEventActionResponseDTO,
     RiskEventActionCreateDTO,
+    RiskSimilarHistoryDTO,
     EmotionReportResponseDTO,
     EmotionSummaryDTO,
     DailyMoodDTO,
     WeeklyEmotionDTO,
     EmotionKeywordDTO,
     TimeSlotCountDTO,
+    VisitMarkerDTO,
     IntakeResultResponseDTO,
     IntakeScoreDTO,
     IntakeAnswerDTO,
     IntakeSessionBriefDTO,
+    IntakePatientInfoDTO,
     AppointmentChangeResponseDTO,
     AppointmentDetailResponseDTO,
     PatientAppointmentsResponseDTO,
@@ -69,17 +77,25 @@ def months_ago_kst(months: int) -> datetime:
 
 
 # 감정 리포트 기간 -> (첫날, 마지막 다음 날)
-# - 임의 결정 D-17: from이 없으면 오늘로 끝나는 기간. week=7일, month=1개월, 3months=3개월
-PERIOD_MONTHS = {"month": 1, "3months": 3}
+# - 임의 결정 D-17: from이 없으면 오늘로 끝나는 기간
+# - 임의 결정 D-45 (D-17 수정): week=7일, month=28일(4주), 3months=84일(12주)
+#   화면의 월간 "10.15 – 11.11", "지난 4주 대비"에 맞춘다. 달력 1개월이 아니다.
+PERIOD_DAYS = {"week": 7, "month": 28, "3months": 84}
 
 def report_range(period: str, start: date | None) -> tuple[date, date]:
+    length = timedelta(days=PERIOD_DAYS[period])
     if start is None:
         end = today_kst() + timedelta(days=1)
-        start = end - timedelta(days=7) if period == "week" else add_months(end, -PERIOD_MONTHS[period])
-        return start, end
+        return end - length, end
 
-    end = start + timedelta(days=7) if period == "week" else add_months(start, PERIOD_MONTHS[period])
-    return start, end
+    return start, start + length
+
+
+# 감정 분석 중 기쁨(joy) 비율 (0~1, 소수 3자리). 분석이 없으면 None
+def joy_ratio_of(emotions: list[tuple]) -> float | None:
+    if not emotions:
+        return None
+    return round(sum(1 for _, dominant in emotions if dominant == EmotionType.JOY) / len(emotions), 3)
 
 
 # 설문 결과 팝업의 척도 카드 3장 (API 명세 F-03: phq9·gad7·isi)
@@ -87,6 +103,29 @@ INTAKE_INSTRUMENTS = (Instrument.PHQ9, Instrument.GAD7, Instrument.ISI)
 
 # 설문 결과 팝업의 문진 목록 개수
 INTAKE_HISTORY_LIMIT = 10
+
+# 척도 만점 (척도 카드 "19 / 27점")
+INSTRUMENT_MAX_SCORE = {Instrument.PHQ9: 27, Instrument.GAD7: 21, Instrument.ISI: 28, Instrument.BDI2: 63}
+
+
+# 만 나이 (오늘 KST 기준, 올해 생일 전이면 1 뺀다). 생년월일이 없으면 None
+def age_of(birth_date: date | None) -> int | None:
+    if birth_date is None:
+        return None
+    today = today_kst()
+    return today.year - birth_date.year - ((today.month, today.day) < (birth_date.month, birth_date.day))
+
+
+# 척도 문항 점수 (임의 결정 D-50)
+# - 척도 문항(instrument 있음)이고 done일 때만: value가 int면 그 값, dict의 score가 int면 그 값, 그 외 None
+# TODO: session_checklists.value의 JSON 모양이 문진 저장 쪽에서 정해지면 이 규칙을 맞춘다.
+def answer_score(instrument: Instrument | None, answer_status: ChecklistStatus, value) -> int | None:
+    if instrument is None or answer_status != ChecklistStatus.DONE:
+        return None
+    if isinstance(value, dict):
+        value = value.get("score")
+    # bool은 int의 하위 클래스라 따로 뺀다 (True가 1점이 되지 않게)
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 # 예약 길이 기본값 (끝 시각을 안 보냈을 때, 임의 결정 D-22)
@@ -120,6 +159,37 @@ PREVIEW_LENGTH = 80
 
 # 임의 결정 D-06: 위험 감지 상세의 "앞뒤 6턴" = 감지된 메시지 앞 6개 + 뒤 6개 메시지
 CONTEXT_AROUND = 6
+
+# 위험 감지 상세의 "이전 기록 최근 30일 유사 표현" 기간 (임의 결정 D-48)
+SIMILAR_RISK_DAYS = 30
+
+
+# 세션 번호 = "A-" + 시작 시각(KST)의 MMDD, 시작 전이면 예정 시각 기준 (임의 결정 D-41)
+# - 상담 상세(F-06)와 위험 감지 상세(F-05)에서 같이 쓴다.
+# TODO: ERD에 세션 번호 컬럼이 없어서 같은 날 세션이 2개면 번호가 겹친다.
+def session_code(session: ChatSession) -> str:
+    base = session.started_at or session.scheduled_at
+    return "A-" + base.astimezone(KST).strftime("%m%d")
+
+
+# 소요 시간(분, 버림). 시작·종료 중 하나라도 없거나 종료가 시작보다 이르면(잘못된 데이터) None
+# - 상담 상세(F-06)와 설문 결과(F-03)에서 같이 쓴다.
+def duration_minutes(started_at: datetime | None, ended_at: datetime | None) -> int | None:
+    if started_at is None or ended_at is None or ended_at < started_at:
+        return None
+    return int((ended_at - started_at).total_seconds() // 60)
+
+
+# 세션 입력 방식: 환자(user) 메시지가 모두 text -> text, 모두 voice -> voice, 섞이면 mixed (임의 결정 D-43)
+# - 환자 메시지가 없으면 None. AI(assistant) 메시지는 보지 않는다.
+# - 상담 상세(F-06)와 설문 결과(F-03)에서 같이 쓴다.
+def input_type_of(messages: list[Message]) -> SessionInputType | None:
+    types = {m.input_type for m in messages if m.role == MessageRole.USER}
+    if not types:
+        return None
+    if len(types) > 1:
+        return "mixed"
+    return "voice" if types == {MessageInputType.VOICE} else "text"
 
 
 # 예외처리, 서비스가 드러나도록 이름을 선정해서 제작
@@ -418,15 +488,22 @@ class DoctorService:
         await self._ensure_in_charge(doctor_id, session.user_id)
 
         # 메시지별 가장 높은 위험 등급
+        risk_rows = await self.repo.find_message_risk_levels(session_id)
         risk_levels: dict[int, RiskEventLevel] = {}
-        for message_id, level in await self.repo.find_message_risk_levels(session_id):
+        for message_id, level in risk_rows:
             if RISK_RANK[level] > RISK_RANK.get(risk_levels.get(message_id), 0):
                 risk_levels[message_id] = level
 
+        # 세션 전체 위험 신호: 알림 수(한 메시지에 알림 2건이면 2) + 가장 높은 등급
+        max_risk_level = max(risk_levels.values(), key=lambda level: RISK_RANK[level], default=None)
+
         messages = []
+        user_emotions: list[EmotionType] = []   # 감정 분석이 있는 환자 메시지의 dominant (대화 순서)
         for message in sorted(session.messages, key=lambda m: m.seq):
             # 임의 결정 D-05: 감정 분석이 여러 건이면 model_version이 가장 큰 1건 (ERD에 created_at 없음)
             analysis = max(message.emotion_analyses, key=lambda a: a.model_version or "", default=None)
+            if analysis and message.role == MessageRole.USER:
+                user_emotions.append(analysis.dominant)
             messages.append(ChatMessageResponseDTO(
                 id=message.id,
                 seq=message.seq,
@@ -436,6 +513,13 @@ class DoctorService:
                 emotion=MessageEmotionDTO.model_validate(analysis) if analysis else None,
                 risk_level=risk_levels.get(message.id)
             ))
+
+        # 이전·다음 세션 (시작 전 세션은 기준 시각이 없어서 둘 다 없음, 임의 결정 D-42)
+        prev_session, next_session = None, None
+        if session.started_at is not None:
+            prev_session, next_session = await self.repo.find_adjacent_sessions(
+                session.user_id, session.session_type, session.started_at, session.id
+            )
 
         return ChatSessionDetailResponseDTO(
             id=session.id,
@@ -447,7 +531,21 @@ class DoctorService:
             ended_at=session.ended_at,
             summary_status=session.summary_status,
             summary=ChatSummaryDTO.model_validate(session.summary) if session.summary else None,
-            messages=messages
+            messages=messages,
+            session_code=session_code(session),
+            duration_minutes=duration_minutes(session.started_at, session.ended_at),
+            prev_session=ChatSessionBriefDTO.model_validate(prev_session) if prev_session else None,
+            next_session=ChatSessionBriefDTO.model_validate(next_session) if next_session else None,
+            input_type=input_type_of(session.messages),
+            # TODO: 감정 변화를 메시지 감정 분석으로 볼지 session_summaries.mood_summary로 볼지 미정 -> 지금은 메시지 기준
+            emotion_change=(
+                EmotionChangeDTO(start=user_emotions[0], end=user_emotions[-1])
+                if len(user_emotions) >= 2 else None
+            ),
+            risk_count=len(risk_rows),
+            max_risk_level=max_risk_level,
+            # 임의 결정 D-44: 턴 = 환자 발화 1 + AI 응답 1 -> 환자 메시지 수 (몇 턴을 펼칠지는 프론트)
+            turn_count=sum(1 for m in session.messages if m.role == MessageRole.USER)
         )
 
 
@@ -486,6 +584,21 @@ class DoctorService:
             {a.actor_id for a in actions if a.actor_type == RiskEventActionActorType.DOCTOR and a.actor_id}
         )
 
+        # 출처 세션 번호 (대화에서 감지됐을 때만, 임의 결정 D-41)
+        session = await self.repo.find_chat_session(messages[0].session_id) if messages else None
+
+        # 지금 담당 의사 (임의 결정 D-47)
+        # TODO: 담당 의사가 여러 명일 때 화면에 몇 명 보여 줄지 미정 -> 지금은 1명
+        doctor_name = await self.repo.find_current_doctor_name(event.user_id)
+
+        # 이전 유사 기록: 이 알림 전 30일 안, 같은 category(없으면 같은 origin) (임의 결정 D-48)
+        # TODO: "유사 표현"을 category로 볼지 걸린 단어(matched_terms)가 겹치는 것으로 볼지 미정 -> 지금은 category
+        similar = await self.repo.find_similar_risk_events(
+            event.user_id, event.category, event.origin,
+            since=event.created_at - timedelta(days=SIMILAR_RISK_DAYS), before=event.created_at, exclude_id=event.id
+        )
+        latest = similar[0] if similar else None
+
         return RiskEventDetailResponseDTO(
             id=event.id,
             patient=DoctorPatientBriefDTO(id=event.user_id, name=event.patient.name if event.patient else None),
@@ -519,7 +632,15 @@ class DoctorService:
                     action=a.action, memo=a.memo, created_at=a.created_at
                 )
                 for a in actions
-            ]
+            ],
+            session_code=session_code(session) if session else None,
+            doctor_name=doctor_name,
+            similar_history=RiskSimilarHistoryDTO(
+                count=len(similar),
+                latest_id=latest.id if latest else None,
+                latest_at=latest.created_at if latest else None,
+                latest_evidence=latest.evidence if latest else None
+            )
         )
 
 
@@ -558,21 +679,53 @@ class DoctorService:
         emotions = await self.repo.find_message_emotions(patient_id, start_at, end_at)
 
         # 요약: 평균 기분, 직전 같은 길이 기간과의 차이
+        prev_first_day = first_day - (next_day - first_day)
         avg = sum(r.mood_score for r in records) / len(records) if records else None
-        prev_avg = await self.repo.avg_mood_score(patient_id, first_day - (next_day - first_day), first_day)
+        prev_avg = await self.repo.avg_mood_score(patient_id, prev_first_day, first_day)
         emotion_counter = Counter(dominant for _, dominant in emotions)
 
-        # 주별 감정 비율 (월요일 시작)
-        weeks: dict[date, Counter] = {}
+        # 기쁨 감정 비율과 직전 같은 길이 기간과의 차이 (0.07이면 화면 "▲ 7%p")
+        # TODO: "기쁨 감정" 칸을 기쁨으로 고정할지 가장 많은 감정(topEmotion)으로 바꿀지 미정 -> 화면대로 기쁨 고정
+        prev_emotions = await self.repo.find_message_emotions(patient_id, kst_day_range(prev_first_day)[0], start_at)
+        joy_ratio, prev_joy_ratio = joy_ratio_of(emotions), joy_ratio_of(prev_emotions)
+
+        # 주별 감정 비율: 기간 첫날부터 7일씩 묶는다 (임의 결정 D-46, 화면 "10.15주 / 10.22주")
+        # - 데이터가 없는 주도 total 0으로 넣어 화면 막대 수를 일정하게 한다.
+        weeks: dict[date, Counter] = {
+            first_day + timedelta(days=offset): Counter() for offset in range(0, total_days, 7)
+        }
         for created_at, dominant in emotions:
             day = created_at.astimezone(KST).date()
-            weeks.setdefault(day - timedelta(days=day.weekday()), Counter())[dominant] += 1
+            weeks[first_day + timedelta(days=7 * ((day - first_day).days // 7))][dominant] += 1
 
         # 시간대별 기록 수 (감정 기록을 남긴 시각)
         slot_counter = Counter(TIME_SLOTS[r.created_at.astimezone(KST).hour // 6] for r in records)
 
+        # 진료일 표시: 기간 안 내가 진료를 마친 예약 + 그날(KST) 가장 늦은 PHQ-9
+        # TODO: 다른 의사의 진료도 넣을지 미정 -> 지금은 내 진료만
+        visits = await self.repo.find_completed_appointments(doctor_id, patient_id, start_at, end_at)
+        phq9_by_day = {
+            # 오래된 순으로 덮어쓰므로 날짜마다 가장 늦은 결과가 남는다.
+            result.assessed_at.astimezone(KST).date(): result
+            for result in await self.repo.find_assessments(patient_id, Instrument.PHQ9, start_at, end_at)
+        }
+        visit_markers = []
+        for visit in visits:
+            day = visit.scheduled_at.astimezone(KST).date()
+            phq9 = phq9_by_day.get(day)
+            visit_markers.append(VisitMarkerDTO(
+                date=day,
+                appointment_id=visit.appointment_id,
+                phq9_score=phq9.total_score if phq9 else None,
+                phq9_severity=phq9.severity if phq9 else None
+            ))
+
+        names = await self.repo.find_user_names({patient_id})
+
+        # TODO: 하루에 감정 기록이 여러 건이면 일별 그래프 값을 어떻게 할지 미정 -> 지금처럼 기록을 그대로 내려 준다.
         return EmotionReportResponseDTO(
             patient_id=patient_id,
+            patient=DoctorPatientBriefDTO(id=patient_id, name=names.get(patient_id)),
             period=period,
             start_date=first_day,
             end_date=next_day - timedelta(days=1),
@@ -581,7 +734,9 @@ class DoctorService:
                 mood_change=round(avg - prev_avg, 2) if avg is not None and prev_avg is not None else None,
                 recorded_days=len({r.record_date for r in records}),
                 total_days=total_days,
-                top_emotion=emotion_counter.most_common(1)[0][0] if emotion_counter else None
+                top_emotion=emotion_counter.most_common(1)[0][0] if emotion_counter else None,
+                joy_ratio=joy_ratio,
+                joy_change=round(joy_ratio - prev_joy_ratio, 3) if joy_ratio is not None and prev_joy_ratio is not None else None
             ),
             daily_moods=[
                 DailyMoodDTO(date=r.record_date, mood_score=r.mood_score, mood_tag=r.mood_tag)
@@ -591,7 +746,10 @@ class DoctorService:
                 WeeklyEmotionDTO(
                     week_start=week_start,
                     total=sum(counter.values()),
-                    ratios={e: round(counter[e] / sum(counter.values()), 3) for e in EmotionType}
+                    ratios={
+                        e: round(counter[e] / sum(counter.values()), 3) if counter else 0.0
+                        for e in EmotionType
+                    }
                 )
                 for week_start, counter in sorted(weeks.items())
             ],
@@ -599,7 +757,8 @@ class DoctorService:
                 EmotionKeywordDTO(keyword=tag, count=count)
                 for tag, count in Counter(r.mood_tag.strip() for r in records if r.mood_tag and r.mood_tag.strip()).most_common(10)
             ],
-            time_slots=[TimeSlotCountDTO(slot=slot, count=slot_counter[slot]) for slot in TIME_SLOTS]
+            time_slots=[TimeSlotCountDTO(slot=slot, count=slot_counter[slot]) for slot in TIME_SLOTS],
+            visit_markers=visit_markers
         )
 
 
@@ -618,14 +777,19 @@ class DoctorService:
                 detail="사전 문진 결과가 없습니다."
             )
 
-        patient = await self.repo.find_user_names({patient_id})
-
         # 척도별 마지막 결과 (오래된 순으로 오므로 뒤의 것이 덮어쓴다) - 임의 결정 D-19
+        # - 결과가 없는 카드도 만점은 넣는다.
         latest = {result.instrument: result for result in await self.repo.find_session_assessments(session.id)}
-        scores = [
-            IntakeScoreDTO.model_validate(latest[instrument]) if instrument in latest else IntakeScoreDTO(instrument=instrument)
-            for instrument in INTAKE_INSTRUMENTS
-        ]
+        scores = []
+        for instrument in INTAKE_INSTRUMENTS:
+            result = latest.get(instrument)
+            scores.append(IntakeScoreDTO(
+                instrument=instrument,
+                total_score=result.total_score if result else None,
+                severity=result.severity if result else None,
+                assessed_at=result.assessed_at if result else None,
+                max_score=INSTRUMENT_MAX_SCORE[instrument]
+            ))
 
         # 문항 순서: sort_order -> 척도 문항 번호 -> id (값이 없으면 뒤로)
         checklists = sorted(
@@ -643,16 +807,27 @@ class DoctorService:
                 required=c.required,
                 status=c.status,
                 skip_reason=c.skip_reason,
-                value=c.value
+                value=c.value,
+                score=answer_score(c.item.instrument, c.status, c.value)
             )
             for c in checklists
         ]
+
+        # 응답률: 필수 문항 중 done 비율 (반올림, 필수 문항이 없으면 100) - 임의 결정 D-49
+        required = [c for c in checklists if c.required]
+        done_count = sum(1 for c in required if c.status == ChecklistStatus.DONE)
+        completion_rate = round(done_count * 100 / len(required)) if required else 100
+
+        # 부제 환자 정보: 이름·성별·만 나이·내 병원 차트번호 (환자 row 1번만 조회)
+        user = await self.repo.find_patient_info(patient_id)
+        profile = await self.repo.find_doctor_profile(doctor_id)
+        chart_no = await self.repo.find_chart_no(patient_id, profile.hospital_id) if profile else None
 
         summary = session.summary
         history = await self.repo.find_intake_sessions(patient_id, INTAKE_HISTORY_LIMIT)
 
         return IntakeResultResponseDTO(
-            patient=DoctorPatientBriefDTO(id=patient_id, name=patient.get(patient_id)),
+            patient=DoctorPatientBriefDTO(id=patient_id, name=user.name if user else None),
             session_id=session.id,
             status=session.status,
             started_at=session.started_at,
@@ -662,7 +837,18 @@ class DoctorService:
             chief_complaint=summary.chief_complaint if summary else None,
             findings=summary.findings if summary else None,
             context_summary=summary.context_summary if summary else None,
-            history=[IntakeSessionBriefDTO.model_validate(s) for s in history]
+            history=[IntakeSessionBriefDTO.model_validate(s) for s in history],
+            patient_info=IntakePatientInfoDTO(
+                gender=user.gender if user else None,
+                birth_date=user.birth_date if user else None,
+                age=age_of(user.birth_date) if user else None,
+                chart_no=chart_no
+            ),
+            input_type=input_type_of(session.messages),
+            duration_minutes=duration_minutes(session.started_at, session.ended_at),
+            completion_rate=completion_rate
+            # TODO: 주 호소 아래 환자 인용 문장 - session_summaries에 칸이 없어서 이번에는 내려 주지 않는다.
+            # TODO: "AI 참고 소견" 라벨 색(파랑·회색·초록) 기준 - findings에 구분 값이 없어서 프론트에서 정한다.
         )
 
 
