@@ -395,7 +395,7 @@ async def add_risk_action(
 )
 async def get_emotion_report(
     patient_id: int,
-    period: Literal["week", "month", "3months"] = Query(default="week", description="week: 1주 / month: 1개월 / 3months: 3개월"),
+    period: Literal["week", "month", "3months"] = Query(default="week", description="week: 7일 / month: 28일(4주) / 3months: 84일(12주)"),
     start: date | None = Query(default=None, alias="from", description="기간 첫날 (없으면 오늘로 끝나는 기간)"),
     current_doctor: UserClaimDTO = Depends(get_current_doctor),
     doctor_service: DoctorService = Depends(get_doctor_service)
