@@ -25,3 +25,14 @@ def add_months(day: date, months: int) -> date:
 def month_range(month: str) -> tuple[date, date]:
     first_day = date(*map(int, month.split("-")), 1)
     return first_day, add_months(first_day, 1)
+
+# 지금 시각(KST)
+def now_kst() -> datetime:
+    return datetime.now(KST)
+
+# day가 있는 주 [월요일, 다음 주 월요일) - 이번주 돌아보기
+def week_range(day:date) -> tuple[date,date]:
+    monday = day - timedelta(days = day.weekday())
+    return monday, monday + timedelta(days=7)
+
+
