@@ -63,22 +63,22 @@ class ScheduleReminderService:
             created_count=created_count
         )
     
-    async def run_schedule_reminder_loop(
-        session_factory: async_sessionmaker[AsyncSession],
-        interval_seconds: int = 60
-    ) -> None:
-        while True:
-            try: 
-                async with session_factory() as db:
-                    service = ScheduleReminderService(ScheduleReminderRepository(db))
-                    result = await service.run_once()
+async def run_schedule_reminder_loop(
+    session_factory: async_sessionmaker[AsyncSession],
+    interval_seconds: int = 60
+) -> None:
+    while True:
+        try: 
+            async with session_factory() as db:
+                service = ScheduleReminderService(ScheduleReminderRepository(db))
+                result = await service.run_once()
 
-                if result.created_count > 0:
-                    print(f"일정 알림 {result.created_count}건 생성")
+            if result.created_count > 0:
+                print(f"일정 알림 {result.created_count}건 생성")
 
-            except Exception:
-                logger.exception("일정알림 스케줄러 실행 중 오류")
+        except Exception:
+            logger.exception("일정알림 스케줄러 실행 중 오류")
 
-            await asyncio.sleep(interval_seconds)
+        await asyncio.sleep(interval_seconds)
 
 
