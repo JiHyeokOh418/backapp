@@ -426,7 +426,9 @@ class LlmService:
                     llm_call_records.append(record)
                     break
             else:
-                errors = await self._validate_llm_output(session_id, parsed, context.checklist)
+                errors = await self._validate_llm_output(
+                    session_id, parsed, context.checklist, context.user_turns
+                )
 
             
 
@@ -518,8 +520,8 @@ class LlmService:
             risk_signals=risk_signals,
             references=None,
             previous_summary=previous_summary,
-            # TODO: 직전 턴의 종료 요청을 서버가 거절했는지는 아직 저장하지 않는다. 저장하게 되면 여기서 사유를 넣는다.
-            end_rejected_reason=None,
+            user_turns=sum(1 for message, _ in rows if message.role == MessageRole.USER),
+            min_user_turns=MIN_USER_TURNS,
         )
 
 
@@ -586,6 +588,10 @@ class LlmService:
                 required=checklist.required,
                 status=ChecklistStatus(checklist.status).value,
                 ask_count=checklist.ask_count,
+                skip_reason=(
+                    SessionChecklistSkipReason(checklist.skip_reason).value
+                    if checklist.skip_reason is not None else None
+                ),
             )
             for checklist in checklists
         ]
@@ -623,12 +629,16 @@ class LlmService:
     # 5-3. 턴 처리 내부: LLM 출력 검증
     # - item_id가 이 세션 항목인지, 상태 전이, value와 answer_type, skip_reason, evidence_seq(사용자 메시지) 확인
     # - checklists: 프롬프트에 넣은 체크리스트 스냅샷 (context.checklist, 값만 담은 dataclass)
+    # - user_turns: 이번 메시지를 포함한 사용자 발화 수 (종료 조건 판정용)
+    # - 종료 요청(counsel_end)도 여기서 확인한다. 조건이 안 되면 재시도시켜서,
+    #   마무리 인사가 담긴 답변이 저장·전송되지 않게 한다. (세션은 ACTIVE인데 환자는 작별 인사를 보는 상황 방지)
     # - 반환: 오류 목록 (비어 있으면 통과)
     async def _validate_llm_output(
         self,
         session_id: int,
         output: LlmReplyOutput,
         checklists: list[ChecklistEntry],
+        user_turns: int,
     ) -> list[str]:
         errors: list[str] = []
         checklist_by_item = {checklist.item_id: checklist for checklist in checklists}
@@ -690,7 +700,54 @@ class LlmService:
         if not output.counsel_end and output.end_reason is not None:
             errors.append("counsel_end가 false이면 end_reason은 null이어야 합니다.")
 
+        # 4. 종료 조건: 이번 턴의 checklist_changes까지 반영했을 때 종료할 수 있는지
+        if output.counsel_end and output.end_reason == "safety":
+            errors.append(
+                "안전 문제를 이유로 상담을 종료하지 않습니다. counsel_end는 false, end_reason은 null로 두고 대화를 이어가세요."
+            )
+        elif output.counsel_end and output.end_reason == "completed":
+            blockers = self._end_blockers(checklists, output, user_turns)
+            if blockers:
+                errors.append(
+                    "아직 상담을 종료할 수 없습니다. (" + " / ".join(blockers) + ") "
+                    "마무리 인사를 하지 말고 counsel_end는 false, end_reason은 null로 두어 대화를 이어가세요."
+                )
+
         return errors
+
+
+    # 5-3-3. 검증 내부: 종료를 막는 사유 목록 (비어 있으면 종료 가능, 순수 함수)
+    # - 프롬프트 스냅샷에 이번 출력의 checklist_changes를 덮어써서 "이번 턴이 저장된 뒤"의 상태로 판단한다.
+    #   (이미 done인 항목은 바뀌지 않는다. 잘못된 변경은 위의 검증에서 따로 오류가 된다)
+    # - 완료 규칙은 _is_required_item_closed를 _is_checklist_complete(저장 시 최종 확인)와 함께 쓴다.
+    @classmethod
+    def _end_blockers(
+        cls,
+        checklists: list[ChecklistEntry],
+        output: LlmReplyOutput,
+        user_turns: int,
+    ) -> list[str]:
+        changes = {change.item_id: change for change in output.checklist_changes}
+        blockers: list[str] = []
+
+        if user_turns < MIN_USER_TURNS:
+            blockers.append(f"사용자 발화가 {user_turns}회로 최소 {MIN_USER_TURNS}회에 못 미칩니다")
+
+        open_items: list[str] = []
+        for checklist in checklists:
+            if not checklist.required:
+                continue
+            status, skip_reason = checklist.status, checklist.skip_reason
+            change = changes.get(checklist.item_id)
+            if change is not None and cls._is_allowed_transition(status):
+                status = change.status
+                skip_reason = change.skip_reason.value if change.skip_reason is not None else None
+            if not cls._is_required_item_closed(status, skip_reason):
+                open_items.append(f"{checklist.item_id}({checklist.label})")
+        if open_items:
+            blockers.append("아직 끝나지 않은 필수 항목: " + ", ".join(open_items))
+
+        return blockers
 
 
     # 5-3-0. 검증/저장 공통: 현재 상태에서 checklist_changes로 바꿀 수 있는지
@@ -832,18 +889,27 @@ class LlmService:
     # 5-7. 턴 처리 내부: 필수 항목이 모두 done 또는 허용된 skipped인지 (순수 함수)
     # - counsel_end는 요청일 뿐이고, 종료는 이 결과(DB 상태)와 MIN_USER_TURNS로 service가 확정한다.
     def _is_checklist_complete(self, checklists: list[SessionChecklist]) -> bool:
-        for checklist in checklists:
-            if not checklist.required:
-                continue
-            if checklist.status == ChecklistStatus.DONE:
-                continue
-            if (
-                checklist.status == ChecklistStatus.SKIPPED
-                and checklist.skip_reason in ALLOWED_REQUIRED_SKIP_REASONS
-            ):
-                continue
-            return False
-        return True
+        return all(
+            self._is_required_item_closed(checklist.status, checklist.skip_reason)
+            for checklist in checklists
+            if checklist.required
+        )
+
+
+    # 5-7-1. 종료 판정 공통: 필수 항목 1건이 끝났는지 (done, 또는 허용된 사유로 skipped)
+    # - 검증(_end_blockers, 문자열 스냅샷)과 저장 시 최종 확인(_is_checklist_complete, ORM enum)이 같은 규칙을 쓴다.
+    @staticmethod
+    def _is_required_item_closed(
+        status: ChecklistStatus | str, skip_reason: SessionChecklistSkipReason | str | None
+    ) -> bool:
+        status = ChecklistStatus(status)
+        if status == ChecklistStatus.DONE:
+            return True
+        return (
+            status == ChecklistStatus.SKIPPED
+            and skip_reason is not None
+            and SessionChecklistSkipReason(skip_reason) in ALLOWED_REQUIRED_SKIP_REASONS
+        )
 
 
     # 5-8. 턴 처리 내부: 재전송 시 기존 AI 답변 조회
@@ -881,7 +947,8 @@ class LlmService:
             await self.repo.create_llm_call(message_id=reply.id, **record)
 
         # 4. 종료 판정: counsel_end는 요청일 뿐. DB의 체크리스트 상태와 최소 턴 수로 확정한다.
-        # TODO: end_reason="safety"는 안전필터를 붙일 때 처리한다. 지금은 "completed"만 종료로 본다.
+        # - 종료 조건은 검증(_end_blockers)에서 이미 확인했다. 여기서는 잠근 상태의 DB로 한 번 더 확인한다. (최종 확인)
+        # - 검증을 통과한 종료 요청은 end_reason="completed"뿐이다. ("safety"는 검증에서 거절)
         if output.counsel_end and output.end_reason == "completed":
             fresh_checklists = await self.repo.find_session_checklist(session.id)
             user_turns = await self.repo.count_user_messages(session.id)

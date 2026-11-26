@@ -119,6 +119,7 @@ class ChecklistEntry:
     required: bool
     status: str  # pending / done / skipped
     ask_count: int
+    skip_reason: str | None = None  # skipped일 때의 사유 (종료 조건 판정용, 프롬프트에는 넣지 않는다)
 
 
 # RAG 검색 결과 1건
@@ -141,7 +142,8 @@ class ReplyContext:
     # RAG 검색 결과. None이면 검색 실패 또는 미사용 (RAG 없이 진행)
     references: list[ReferenceChunk] | None
     previous_summary: str | None = None  # 이전 세션의 context_summary
-    end_rejected_reason: str | None = None  # 직전 턴의 종료 요청을 서버가 거절한 사유
+    user_turns: int = 0  # 이번 메시지를 포함한 사용자 발화 수
+    min_user_turns: int = 0  # 종료할 수 있는 최소 사용자 발화 수 (service의 MIN_USER_TURNS)
     feedback: str | None = None  # 직전 시도의 검증 실패 사유
     attempt: int = 1
 
@@ -281,11 +283,14 @@ def _render_references(references: list[ReferenceChunk] | None) -> dict[str, str
     return {tag: "\n\n".join(items) if items else NOT_PROVIDED for tag, items in grouped.items()}
 
 
-def _render_session_state(end_rejected_reason: str | None) -> str:
-    state = "상담이 진행 중이다."
-    if end_rejected_reason:
-        state += f"\n직전 턴의 종료 요청을 서버가 받아들이지 않았다. 사유: {_escape(end_rejected_reason)}"
-    return state
+def _render_session_state(user_turns: int, min_user_turns: int) -> str:
+    # 종료 조건을 미리 알려서, 조건이 안 되는데 마무리 인사를 하는 출력(재시도 대상)을 줄인다.
+    lines = ["상담이 진행 중이다.", f"사용자 발화 수: {user_turns}회 (이번 발화 포함)"]
+    if user_turns < min_user_turns:
+        lines.append(f"사용자 발화가 {min_user_turns}회 이상이어야 종료할 수 있다. 이번 턴에는 counsel_end를 true로 두지 않는다.")
+    else:
+        lines.append("필수 항목이 모두 끝났다면 이번 턴에 종료할 수 있다.")
+    return "\n".join(lines)
 
 
 # 상담 턴 user 메시지
@@ -295,7 +300,7 @@ def build_reply_user_content(context: ReplyContext) -> str:
     references = _render_references(context.references)
 
     sections = [
-        _tag("session_state", _render_session_state(context.end_rejected_reason)),
+        _tag("session_state", _render_session_state(context.user_turns, context.min_user_turns)),
         _tag("previous_session_summary", _escape(context.previous_summary) if context.previous_summary else NOT_PROVIDED),
         _tag("checklist", _render_checklist(context.checklist)),
         _tag("risk_analysis", _render_risk(context.risk_signals, latest_user_seq)),
