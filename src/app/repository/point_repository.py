@@ -35,7 +35,7 @@ class PointRepository:
             .with_for_update()
         )
         result = await self.db.execute(query)
-        return result.scalar_one_or_none
+        return result.scalar_one_or_none()
 
     #3. 내역 1줄 추가 (flush하면 history_id가 채워진다)
     async def insert_history(self, history: PointHistory) -> PointHistory:
