@@ -24,10 +24,16 @@ async def lifespan(app: FastAPI):
         async with start_s3_client(app):
             print("S3 연결 성공!")
 
-    
-            # 4. 전이학습 모델 로드
+            # 4. 감정분석 모델 로드 (서버가 요청을 받기 전에. 실패하면 감정분석 없이 진행)
+            try:
+                app.state.emotion_analyzer = await asyncio.to_thread(EmotionAnalyzer)
+                print(f"감정분석 모델 로드 성공! ({app.state.emotion_analyzer.model_version})")
+            except Exception as e:
+                app.state.emotion_analyzer = None
+                print(f"감정분석 모델 로드 실패: {e!r}")
 
-            # 5. 일정 알림 스케줄러 시작
+            # 5. 일정 알림 스케줄러 시작 (서버 종료 시 취소)
+            # - lifespan의 yield는 이 한 곳뿐이다. yield 앞은 시작 처리, finally는 종료 처리
             reminder_task = asyncio.create_task(run_schedule_reminder_loop(AsyncSessionLocal))
             try:
                 yield
@@ -37,14 +43,6 @@ async def lifespan(app: FastAPI):
                     await reminder_task
                 except asyncio.CancelledError:
                     pass
-            try:
-                app.state.emotion_analyzer = await asyncio.to_thread(EmotionAnalyzer)
-                print(f"감정분석 모델 로드 성공! ({app.state.emotion_analyzer.model_version})")
-            except Exception as e:
-                app.state.emotion_analyzer = None
-                print(f"감정분석 모델 로드 실패: {e!r}")
-
-            yield
 
 app = FastAPI(
     lifespan=lifespan,
