@@ -44,3 +44,6 @@ dependencies:
         - pgvector
         - greenlet
         - psycopg[binary]
+        - llama_index
+        - anthropic
+        - transformers

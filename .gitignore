@@ -101,3 +101,5 @@ temp/
 
 # 가상환경
 environment.yaml
+.claude
+src/scripts

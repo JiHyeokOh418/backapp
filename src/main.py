@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import FastAPI
 from app.security.cors import setup_cors
 from app.security.security_headers import set_up_security
@@ -5,8 +6,9 @@ from contextlib import asynccontextmanager
 from app.infrastructure.postgresql import engine, Base
 from app.infrastructure.redis import start_redis_client
 from app.infrastructure.s3 import start_s3_client
+from app.ml.emotion_analysis import EmotionAnalyzer
 import app.models
-from app.api import default_api, auth_api, user_api, memo_api, doctor_verification_api, doctor_api, mypage_api, mood_record_api, reflection_api, diary_api, calendar_api, care_task_api, point_api
+from app.api import default_api, auth_api, user_api, memo_api, doctor_verification_api, doctor_api, mypage_api, mood_record_api, reflection_api, diary_api, calendar_api, care_task_api, point_api, llm_api
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -21,7 +23,13 @@ async def lifespan(app: FastAPI):
         async with start_s3_client(app):
             print("S3 연결 성공!")
 
-            # 4. 전이학습 모델 로드
+            try:
+                app.state.emotion_analyzer = await asyncio.to_thread(EmotionAnalyzer)
+                print(f"감정분석 모델 로드 성공! ({app.state.emotion_analyzer.model_version})")
+            except Exception as e:
+                app.state.emotion_analyzer = None
+                print(f"감정분석 모델 로드 실패: {e!r}")
+
             yield
 
 app = FastAPI(
@@ -53,4 +61,6 @@ app.include_router(diary_api.router, prefix="/diaries", tags=["diaries"])
 app.include_router(care_task_api.router, prefix="/care-tasks", tags=["care-tasks"])
 app.include_router(doctor_verification_api.router, prefix="/doctor", tags=["doctor-verification"])
 app.include_router(doctor_verification_api.admin_router, prefix="/admin", tags=["admin"])
+app.include_router(llm_api.router, prefix="/chat", tags=["chat"])
+app.include_router(llm_api.doctor_router, prefix="/doctor", tags=["doctor-chat"])
 app.include_router(point_api.router, prefix="/points", tags=["points"])
