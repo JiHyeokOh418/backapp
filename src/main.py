@@ -6,7 +6,7 @@ from app.infrastructure.postgresql import engine, Base
 from app.infrastructure.redis import start_redis_client
 from app.infrastructure.s3 import start_s3_client
 import app.models
-from app.api import default_api, auth_api, user_api, memo_api, doctor_verification_api, doctor_api, calendar_api
+from app.api import default_api, auth_api, user_api, memo_api, doctor_verification_api, doctor_api, mypage_api, mood_record_api, reflection_api, diary_api, calendar_api, care_task_api, point_api
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -46,5 +46,11 @@ app.include_router(user_api.router, prefix="/users", tags=["users"])
 app.include_router(doctor_api.router, prefix="/doctor", tags=["doctor"])
 app.include_router(calendar_api.router, prefix="/calendar", tags=["calendar"])
 app.include_router(memo_api.router, prefix="/doctor", tags=["memo"])
+app.include_router(mypage_api.router, prefix="/mypage", tags=["mypage"])
+app.include_router(mood_record_api.router, prefix="/mood-records", tags=["mood-records"])
+app.include_router(reflection_api.router, prefix="/reflections", tags=["reflections"])
+app.include_router(diary_api.router, prefix="/diaries", tags=["diaries"])
+app.include_router(care_task_api.router, prefix="/care-tasks", tags=["care-tasks"])
 app.include_router(doctor_verification_api.router, prefix="/doctor", tags=["doctor-verification"])
 app.include_router(doctor_verification_api.admin_router, prefix="/admin", tags=["admin"])
+app.include_router(point_api.router, prefix="/points", tags=["points"])
