@@ -37,7 +37,7 @@ class CareTaskRepository:
          return result.scalar_one_or_none()
 
     #2. 사용 중인 목표 목록 (표시 순서대로) - 일일목표 또는 보너스
-    async def find_active_mission(self, mission_type: MissionType) -> list[Mission]:
+    async def find_active_missions(self, mission_type: MissionType) -> list[Mission]:
          query = (
               select(Mission)
               .where(Mission.mission_type == mission_type, Mission.is_active.is_(True))
@@ -67,9 +67,57 @@ class CareTaskRepository:
          return result.scalars().first()
 
     #5. 사용 중인 모두 완료 보너스 1개
-    async  
+    async def find_bonus_mission(self) -> Mission|None:
+         missions = await self.find_active_mission(MissionType.ALL_CLEAR_BONUS)
+         return missions[0] if missions else None
 
+    #6. 그날 내 수행 기록 전부 (오늘 할 일 목록에 완료 여부를 붙일 때)
+    async def find_logs_on(self, user_id: int, day:date) -> list[UserMissionLog]:
+         query = select(UserMissionLog).where(
+              UserMissionLog.user_id == user_id,
+              UserMissionLog.log_date == day
+         )
+         result = await self.db.execute(query)
+         return list(result.scalars().all())
 
+    #7. 그날 목표 1개의 수행 기록(하루1줄)
+    async def find_log(self, user_id: int, mission_id: int, day: date) -> UserMissionLog | None:
+        query = select(UserMissionLog).where(
+            UserMissionLog.user_id == user_id,
+            UserMissionLog.mission_id == mission_id,
+            UserMissionLog.log_date == day
+        )
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
+
+    #8. 수행 기록 새로 만들기(flush하면 log_id가 채워진다)
+    # 이미 있는 기록은 service에서 값만 바꾸고 flush()한다.
+    async def add_log(self, log: UserMissionLog) -> UserMissionLog:
+         self.db.add(log)
+         await self.db.flush()
+         return log
+    
+    #9. 기간 [start,end] 날짜별 완료 개수 - 취소한 것 제외, mission_ids 안의 목표만(이번주 돌아보기)
+    async def count_completed_by_day(
+              self, user_id: int, mission_ids: list[int], start:date, end:date
+    ) -> dict[date,int]:
+         if not mission_ids:
+              return{}
+         query = (
+              select(UserMissionLog.log_date, func.count())
+              .where(
+                   UserMissionLog.user_id == user_id,
+                   UserMissionLog.mission_id.in_(mission_ids),
+                   UserMissionLog.log_date>=start,
+                   UserMissionLog.log_date<end,
+                   UserMissionLog.completed_at.is_not(None),
+                   UserMissionLog.canceled_at.is_(None)
+              )
+              .group_by(UserMissionLog.log_date)
+         )
+         result = await self.db.execute(query)
+         return {log_date: count for log_date, count in result.all()}
+        
 
 
 def get_care_task_repository(db: AsyncSession = Depends(get_postgresql_db)) -> CareTaskRepository:
