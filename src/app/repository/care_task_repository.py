@@ -44,13 +44,13 @@ class CareTaskRepository:
               .order_by(Mission.sort_order, Mission.mission_id)
          )
          result = await self.db.execute(query)
-         return list(result.scalar().all())
+         return list(result.scalars().all())
 
     #3. 목표 1개
     async def find_mission(self, mission_id: int) -> Mission | None:
          query = select(Mission).where(Mission.mission_id == mission_id)
          result = await self.db.execute(query)
-         return list(result.scalar_one_or_none())
+         return result.scalar_one_or_none()
          
     #4. 이름으로 사용 중인 일일목표 1개 (자동 완료: 일기&감정 기록&상담에서 부를 떄)
     async def find_active_daily_goal_by_name(self, name:str) -> Mission|None:
@@ -68,7 +68,7 @@ class CareTaskRepository:
 
     #5. 사용 중인 모두 완료 보너스 1개
     async def find_bonus_mission(self) -> Mission|None:
-         missions = await self.find_active_mission(MissionType.ALL_CLEAR_BONUS)
+         missions = await self.find_active_missions(MissionType.ALL_CLEAR_BONUS)
          return missions[0] if missions else None
 
     #6. 그날 내 수행 기록 전부 (오늘 할 일 목록에 완료 여부를 붙일 때)
