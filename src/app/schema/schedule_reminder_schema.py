@@ -19,6 +19,6 @@ class ScheduleReminderTargetDTO(BaseDTO):
 
 # 스케줄러 1회 실행 결과 (로그·테스트 확인용)
 class ScheduleReminderRunResultDTO(BaseDTO):
+    lock_acquired : bool # 다른 워커가 실행 중이라 건너뛰었으면 False
     checked_count: int  # 이번 실행에서 대상으로 조회된 일정 수
     created_count: int  # 알림을 실제로 만든 수
-    skipped_count: int  # 이미 알림이 있어서 건너뛴 수
