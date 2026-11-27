@@ -22,8 +22,8 @@ REASON_MAX_LENGTH = 50
 
 
 # 포인트 비즈니스 로직, 예외 처리
-# - earn / spend / cancel 은 다른 서비스(오늘 할 일, 포인트샵, 자장가)가 부른다.
-# - 이 세 함수는 commit하지 않는다. 부른 서비스가 자기 일까지 끝낸 뒤 한 번에 commit한다.
+# - earn / spend 는 다른 서비스(오늘 할 일, 포인트샵, 자장가)가 부른다.
+# - 이 두 함수는 commit하지 않는다. 부른 서비스가 자기 일까지 끝낸 뒤 한 번에 commit한다.
 class PointService:
 
     def __init__(self, repo: PointRepository):
